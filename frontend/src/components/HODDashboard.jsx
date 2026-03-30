@@ -40,8 +40,20 @@ export default function HODDashboard() {
   const [mentors, setMentors] = useState([]);
   const [mentees, setMentees] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [activeBatch, setActiveBatch] = useState(null);
 
   const hodEmail = localStorage.getItem('userEmail') || 'hod';
+
+  // Fetch active academic year
+  useEffect(() => {
+    axios.get(`${API}/batches/active`)
+      .then(r => {
+        if (r.data.success && r.data.data) {
+          setActiveBatch(r.data.data.name);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const load = async () => {
@@ -128,6 +140,15 @@ export default function HODDashboard() {
             <p className="text-xs" style={{ color: "var(--text-muted)" }}>Head of Department</p>
           </div>
         </div>
+
+        {/* Active Academic Year */}
+        {activeBatch && (
+          <div className="rounded-xl p-3 mb-2"
+            style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.15)' }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: '#818cf8' }}>📅 Academic Year</p>
+            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch}</p>
+          </div>
+        )}
 
         <nav className="flex flex-col gap-1 flex-1">
           {tabBtn("overview", "Overview", "📊")}

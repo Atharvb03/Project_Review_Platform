@@ -27,6 +27,8 @@ export default function MentorDashboard() {
   const [activeTab, setActiveTab]           = useState('submissions');
   const [dashData, setDashData]             = useState(null);
   const [dashLoading, setDashLoading]       = useState(false);
+  // Active academic year
+  const [activeBatch, setActiveBatch]       = useState(null);
   const navigate = useNavigate();
   const { dark, toggle } = useTheme();
 
@@ -36,6 +38,17 @@ export default function MentorDashboard() {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
   };
+
+  // Fetch active academic year
+  useEffect(() => {
+    axios.get(`${API}/batches/active`)
+      .then(r => {
+        if (r.data.success && r.data.data) {
+          setActiveBatch(r.data.data.name);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!mentorEmail) return;
@@ -271,6 +284,15 @@ export default function MentorDashboard() {
             <p className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>{mentorEmail || 'Dashboard'}</p>
           </div>
         </div>
+
+        {/* Active Academic Year */}
+        {activeBatch && (
+          <div className="rounded-xl p-3 mb-2"
+            style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.15)' }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: '#818cf8' }}>📅 Academic Year</p>
+            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch}</p>
+          </div>
+        )}
 
         {/* Tab switcher */}
         <div className="flex gap-1 mb-2 p-1 rounded-xl" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(236,72,153,0.1)' }}>

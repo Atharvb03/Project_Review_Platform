@@ -35,7 +35,7 @@ function StatusBadge({ text }) {
 
 export default function ProjectCoordinatorDashboard() {
   const { dark, toggle } = useTheme();
-  const [tab, setTab] = useState('mentees'); // 'dashboard' | 'mentees' | 'assign' | 'bulk' | 'list' | 'update' | 'projects'
+  const [tab, setTab] = useState('mentees'); // 'dashboard' | 'mentees' | 'assign' | 'bulk' | 'list' | 'update' | 'projects' | 'batches'
   const [mentors, setMentors] = useState([]);
   const [mentees, setMentees] = useState([]);
   const [assignments, setAssignments] = useState([]);
@@ -44,6 +44,12 @@ export default function ProjectCoordinatorDashboard() {
   const [msg, setMsg] = useState(null);
   const [dashData, setDashData] = useState(null);
   const [dashLoading, setDashLoading] = useState(false);
+
+  // Batch management
+  const [batches, setBatches] = useState([]);
+  const [batchForm, setBatchForm] = useState({ name: '', isActive: false });
+  const [activeBatch, setActiveBatch] = useState(null);
+  const [batchLoading, setBatchLoading] = useState(false);
 
   // Assign form
   const [form, setForm] = useState({ menteeEmail: '', mentorEmail: '', duration: '6_months' });
@@ -67,12 +73,63 @@ export default function ProjectCoordinatorDashboard() {
     axios.get(`${API}/mentees`).then(r => setMentees(r.data.data || [])).catch(() => {});
     fetchProjects();
     fetchAssignments();
+    fetchBatches();
   }, []);
 
   const fetchAssignments = () => {
     axios.get(`${API}/assignments`).then(r => {
       setAssignments(r.data.data || []);
     }).catch(() => {});
+  };
+
+  const fetchBatches = () => {
+    axios.get(`${API}/batches`).then(r => {
+      const batchList = r.data.data || [];
+      setBatches(batchList);
+      // Set active batch for display
+      const active = batchList.find(b => b.isActive);
+      if (active) setActiveBatch(active.name);
+    }).catch(() => {});
+  };
+
+  const handleCreateBatch = async () => {
+    if (!batchForm.name?.trim()) {
+      return flash('Batch name is required (e.g., "2025-26")', 'error');
+    }
+    setBatchLoading(true);
+    try {
+      await axios.post(`${API}/batches`, batchForm);
+      flash('Academic year created successfully!', 'success');
+      setBatchForm({ name: '', isActive: false });
+      fetchBatches();
+    } catch (err) {
+      flash(err.response?.data?.message || 'Failed to create batch', 'error');
+    } finally {
+      setBatchLoading(false);
+    }
+  };
+
+  const handleActivateBatch = async (id) => {
+    try {
+      const res = await axios.patch(`${API}/batches/${id}/activate`);
+      flash(res.data.message, 'success');
+      fetchBatches();
+    } catch (err) {
+      flash(err.response?.data?.message || 'Failed to activate batch', 'error');
+    }
+  };
+
+  const handleDeleteBatch = async (id, name) => {
+    if (!window.confirm(`Are you sure you want to delete academic year "${name}"? This action cannot be undone.`)) {
+      return;
+    }
+    try {
+      const res = await axios.delete(`${API}/batches/${id}`);
+      flash(res.data.message, 'success');
+      fetchBatches();
+    } catch (err) {
+      flash(err.response?.data?.message || 'Failed to delete batch', 'error');
+    }
   };
 
   const fetchDashboard = () => {
@@ -229,8 +286,18 @@ export default function ProjectCoordinatorDashboard() {
           </div>
         </div>
 
+        {/* Active Academic Year */}
+        {activeBatch && (
+          <div className="rounded-xl p-3 mb-2"
+            style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.15)' }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: '#818cf8' }}>📅 Active Academic Year</p>
+            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch}</p>
+          </div>
+        )}
+
         <nav className="flex flex-col gap-1 flex-1">
           {tabBtn('dashboard', 'Dashboard', '📊')}
+          {tabBtn('batches', 'Academic Years', '📅')}
           {tabBtn('mentees', 'Mentees & Projects', '👥')}
           {tabBtn('assign', 'Assign Mentor', '➕')}
           {tabBtn('bulk', 'Bulk CSV Assign', '📥')}
@@ -262,6 +329,7 @@ export default function ProjectCoordinatorDashboard() {
           <div className="mb-8">
             <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>
               {tab === 'dashboard' && 'Dashboard'}
+              {tab === 'batches' && 'Academic Years Management'}
               {tab === 'mentees'  && 'Mentees & Projects'}
               {tab === 'assign' && 'Assign Mentor'}
               {tab === 'bulk'   && 'Bulk CSV Assign'}
@@ -271,6 +339,7 @@ export default function ProjectCoordinatorDashboard() {
             </h1>
             <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
               {tab === 'dashboard' && 'System-wide stats and assignment overview'}
+              {tab === 'batches' && 'Create and manage academic years (batches) for project grouping'}
               {tab === 'mentees'  && 'View mentees, approve/reject projects, and assign mentors'}
               {tab === 'assign' && 'Assign a mentor to a mentee (project name auto-fetched)'}
               {tab === 'bulk'   && 'Upload a CSV to assign multiple mentors at once'}
@@ -764,6 +833,129 @@ student2@college.com,mentor2@college.com,1_year`}
                   : '✏️ Save Changes'
                 }
               </button>
+            </div>
+          )}
+
+          {/* ── ACADEMIC YEARS (BATCHES) TAB ── */}
+          {tab === 'batches' && (
+            <div className="space-y-6">
+              {/* Create New Batch Form */}
+              <div className="glass rounded-2xl p-6" style={{ border: '1px solid rgba(236,72,153,0.12)' }}>
+                <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>
+                  Create New Academic Year
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <Field label="Academic Year Name">
+                    <input
+                      type="text"
+                      placeholder="e.g., 2025-26"
+                      value={batchForm.name}
+                      onChange={(e) => setBatchForm({ ...batchForm, name: e.target.value })}
+                      className="input-custom w-full px-4 py-2.5 rounded-xl text-sm"
+                    />
+                  </Field>
+                  <Field label="Set as Active">
+                    <select
+                      value={batchForm.isActive}
+                      onChange={(e) => setBatchForm({ ...batchForm, isActive: e.target.value === 'true' })}
+                      className="input-custom w-full px-4 py-2.5 rounded-xl text-sm"
+                    >
+                      <option value="false">No</option>
+                      <option value="true">Yes</option>
+                    </select>
+                  </Field>
+                  <div className="flex items-end">
+                    <button
+                      onClick={handleCreateBatch}
+                      disabled={batchLoading}
+                      className="btn-primary-custom w-full py-2.5 rounded-xl text-white font-semibold text-sm disabled:opacity-60"
+                    >
+                      {batchLoading ? 'Creating...' : 'Create Academic Year'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Existing Batches List */}
+              <div className="glass rounded-2xl overflow-hidden" style={{ border: '1px solid rgba(236,72,153,0.12)' }}>
+                <div className="px-5 py-3" style={{ borderBottom: '1px solid rgba(236,72,153,0.1)', background: 'rgba(236,72,153,0.04)' }}>
+                  <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                    All Academic Years ({batches.length})
+                  </p>
+                </div>
+                {batches.length === 0 ? (
+                  <div className="p-8 text-center" style={{ color: 'var(--text-muted)' }}>
+                    <p className="text-4xl mb-3">📅</p>
+                    <p>No academic years created yet. Create one above to get started.</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr style={{ borderBottom: '1px solid rgba(236,72,153,0.08)', background: 'rgba(255,255,255,0.02)' }}>
+                          <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                            Academic Year
+                          </th>
+                          <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                            Status
+                          </th>
+                          <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                            Created
+                          </th>
+                          <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                            Action
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {batches.map((batch, idx) => (
+                          <tr key={batch._id} style={{ borderBottom: idx < batches.length - 1 ? '1px solid rgba(236,72,153,0.06)' : 'none' }}>
+                            <td className="px-4 py-3 font-semibold" style={{ color: 'var(--text-primary)' }}>
+                              {batch.name}
+                            </td>
+                            <td className="px-4 py-3">
+                              {batch.isActive ? (
+                                <span className="px-3 py-1 rounded-full text-xs font-medium" style={{ background: 'rgba(16,185,129,0.15)', color: '#10b981' }}>
+                                  ✅ Active
+                                </span>
+                              ) : (
+                                <span className="px-3 py-1 rounded-full text-xs font-medium" style={{ background: 'rgba(156,163,175,0.15)', color: '#9ca3af' }}>
+                                  Inactive
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>
+                              {new Date(batch.createdAt).toLocaleDateString()}
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="flex gap-2">
+                                {!batch.isActive && (
+                                  <button
+                                    onClick={() => handleActivateBatch(batch._id)}
+                                    className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:scale-105"
+                                    style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}
+                                  >
+                                    Set as Active
+                                  </button>
+                                )}
+                                {!batch.isActive && (
+                                  <button
+                                    onClick={() => handleDeleteBatch(batch._id, batch.name)}
+                                    className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:scale-105"
+                                    style={{ background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.2)' }}
+                                  >
+                                    Delete
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 

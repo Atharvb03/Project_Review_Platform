@@ -42,11 +42,24 @@ function Navbar() {
   const { dark } = useTheme();
   const [scrolled, setScrolled] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [activeBatch, setActiveBatch] = useState(null);
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 20);
     window.addEventListener('scroll', onScroll);
     return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // Fetch active academic year
+  useEffect(() => {
+    fetch('http://localhost:5000/api/batches/active')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.data) {
+          setActiveBatch(data.data.name);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   const navBg = scrolled
@@ -78,6 +91,17 @@ function Navbar() {
 
           {/* Desktop nav links */}
           <div className="hidden md:flex items-center gap-8">
+            {activeBatch && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg" 
+                style={{ 
+                  background: dark ? 'rgba(236,72,153,0.1)' : 'rgba(236,72,153,0.08)', 
+                  border: '1px solid rgba(236,72,153,0.2)' 
+                }}>
+                <span className="text-xs font-semibold" style={{ color: '#f472b6' }}>
+                  📅 Academic Year: {activeBatch}
+                </span>
+              </div>
+            )}
             {['Features', 'About', 'Contact'].map((item) => (
               <a key={item} href={`#${item.toLowerCase()}`} className={`text-sm font-medium transition-colors ${linkClass}`}>
                 {item}

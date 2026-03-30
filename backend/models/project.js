@@ -16,6 +16,12 @@ const projectSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // ADDED: academic year (batch) reference
+  batchId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Batch',
+    // Optional for backward compatibility with old projects
+  },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Project', projectSchema);

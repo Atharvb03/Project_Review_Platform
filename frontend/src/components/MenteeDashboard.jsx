@@ -63,6 +63,8 @@ export default function MenteeDashboard() {
   // ADDED: archived files from previous projects
   const [archivedFiles, setArchivedFiles] = useState([]);
   const [showArchivedFiles, setShowArchivedFiles] = useState(false);
+  // ADDED: active academic year
+  const [activeBatch, setActiveBatch] = useState(null);
   const navigate = useNavigate();
   const { dark, toggle } = useTheme();
   const menteeEmail = localStorage.getItem('userEmail') || '';
@@ -114,6 +116,17 @@ export default function MenteeDashboard() {
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  // Fetch active academic year
+  useEffect(() => {
+    axios.get(`${API}/batches/active`)
+      .then(r => {
+        if (r.data.success && r.data.data) {
+          setActiveBatch(r.data.data.name);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   // Initial load
@@ -507,6 +520,15 @@ export default function MenteeDashboard() {
           </div>
         </div>
 
+        {/* Active Academic Year */}
+        {activeBatch && (
+          <div className="rounded-xl p-3 mb-2"
+            style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.15)' }}>
+            <p className="text-xs font-semibold mb-1" style={{ color: '#818cf8' }}>📅 Academic Year</p>
+            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch}</p>
+          </div>
+        )}
+
         {/* Assigned mentor + project status (merged) */}
         <div className="rounded-xl p-3 mb-2"
           style={{ background: assignment ? 'rgba(236,72,153,0.08)' : 'rgba(255,255,255,0.03)', border: '1px solid rgba(236,72,153,0.15)' }}>
@@ -697,6 +719,20 @@ export default function MenteeDashboard() {
                   </button>
                 )}
               </div>
+
+              {/* Toast notification for dashboard tab */}
+              {toast && (
+                <div
+                  className="mb-4 flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium"
+                  style={{
+                    background: toast.type === 'success' ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)',
+                    border: `1px solid ${toast.type === 'success' ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)'}`,
+                    color: toast.type === 'success' ? '#10b981' : '#f87171',
+                  }}
+                >
+                  {toast.msg}
+                </div>
+              )}
 
               {/* Project Section */}
               <div className="mb-6">

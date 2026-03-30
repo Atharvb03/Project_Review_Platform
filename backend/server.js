@@ -43,9 +43,9 @@ app.use(cors({
     credentials: true
 }));
 
-// MongoDB Setup (keep only users and projects collections)
+// MongoDB Setup
 const client = new MongoClient(mongoURI);
-let db, usersCollection, projectsCollection;
+let db, usersCollection, projectsCollection, batchesCollection;
 
 async function connectDB() {
     try {
@@ -53,7 +53,12 @@ async function connectDB() {
         db = client.db("project_management");
         usersCollection = db.collection("users");
         projectsCollection = db.collection("projects");
+        batchesCollection = db.collection("batches");
         console.log("✅ Connected to MongoDB");
+        
+        // Create unique index on batch name
+        await batchesCollection.createIndex({ name: 1 }, { unique: true });
+        
         // Start deadline reminder cron job after DB is ready
         initDeadlineReminder(db, usersCollection);
     } catch (err) {
@@ -649,6 +654,65 @@ app.post("/api/mentee/create-project", requireRole('mentee'), async (req, res) =
         console.log('[CREATE PROJECT] User found:', user.email);
         console.log('[CREATE PROJECT] Existing project name:', user.projectName);
         
+        // Get active batch first (needed for all checks)
+        const activeBatch = await batchesCollection.findOne({ isActive: true });
+        if (!activeBatch) {
+            console.log('[CREATE PROJECT] No active academic year found');
+            return res.status(400).json({ 
+                success: false, 
+                message: "No active academic year. Please contact the coordinator to set up the current academic year." 
+            });
+        }
+        console.log('[CREATE PROJECT] Active batch:', activeBatch.name);
+        console.log('[CREATE PROJECT] Active batch ID:', activeBatch._id);
+        
+        // CRITICAL: Check ALL projects in current batch (including archived ones)
+        // This prevents creating multiple projects after completing a 1-year project
+        const allProjectsInBatch = await projectsCollection.find({
+            menteeEmail: req.userEmail,
+            batchId: activeBatch._id
+        }).toArray();
+        
+        console.log('[CREATE PROJECT] Total projects in current batch:', allProjectsInBatch.length);
+        console.log('[CREATE PROJECT] Projects details:', JSON.stringify(allProjectsInBatch.map(p => ({
+            name: p.projectName,
+            duration: p.duration,
+            isCompleted: p.isCompleted,
+            batchId: p.batchId,
+            isArchived: p.isArchived
+        })), null, 2));
+        
+        // Check if any completed 1-year project exists in this batch
+        const has1YearProjectInBatch = allProjectsInBatch.some(p => 
+            p.duration === '1_year' && p.isCompleted
+        );
+        
+        console.log('[CREATE PROJECT] Has completed 1-year project in batch?', has1YearProjectInBatch);
+        
+        if (has1YearProjectInBatch) {
+            console.log('[CREATE PROJECT] Already has a completed 1-year project in this batch - BLOCKED');
+            return res.status(400).json({ 
+                success: false, 
+                message: "You cannot create another project in the same academic year after completing a 1-year project. Please wait for the next academic year." 
+            });
+        }
+        
+        // Count completed 6-month projects in current batch
+        const completed6MonthProjects = allProjectsInBatch.filter(p => 
+            p.duration === '6_months' && p.isCompleted
+        ).length;
+        
+        console.log('[CREATE PROJECT] Completed 6-month projects in current batch:', completed6MonthProjects);
+        
+        // Check if already has 2 completed 6-month projects
+        if (completed6MonthProjects >= 2) {
+            console.log('[CREATE PROJECT] Already has 2 completed 6-month projects in this batch - BLOCKED');
+            return res.status(400).json({ 
+                success: false, 
+                message: "You have already completed 2 projects in this academic year. Maximum 2 projects (6-months each) allowed per year." 
+            });
+        }
+        
         // Check if previous project is completed (declare variables here for later use)
         const previousProject = await projectsCollection.findOne({ 
             menteeEmail: req.userEmail,
@@ -772,6 +836,9 @@ app.post("/api/mentee/create-project", requireRole('mentee'), async (req, res) =
         console.log('[CREATE PROJECT] User document updated');
         console.log('[CREATE PROJECT] Updating projects collection...');
         
+        // Active batch already fetched above
+        console.log('[CREATE PROJECT] Using active batch:', activeBatch.name);
+        
         // Also create/update in projects collection
         await projectsCollection.updateOne(
             { menteeEmail: req.userEmail },
@@ -785,6 +852,7 @@ app.post("/api/mentee/create-project", requireRole('mentee'), async (req, res) =
                     groupMembers: sanitizedMembers,
                     status: 'pending',
                     isCompleted: false, // Reset completion status
+                    batchId: activeBatch._id, // Assign to active academic year
                     createdAt: new Date(),
                     updatedAt: new Date(),
                 }
@@ -1246,6 +1314,134 @@ app.patch("/api/coordinator/project-status", verifyToken, checkRole('project_coo
     }
 });
 
+/*************** BATCH (ACADEMIC YEAR) ROUTES ***************/
+
+// GET /api/batches — get all academic years
+app.get("/api/batches", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const batches = await batchesCollection.find({}).sort({ createdAt: -1 }).toArray();
+        res.json({ success: true, data: batches });
+    } catch (err) {
+        console.error('[BATCH FETCH] Error:', err);
+        res.status(500).json({ success: false, message: "Failed to fetch batches" });
+    }
+});
+
+// GET /api/batches/active — get active academic year
+app.get("/api/batches/active", async (req, res) => {
+    try {
+        const activeBatch = await batchesCollection.findOne({ isActive: true });
+        if (!activeBatch) {
+            return res.json({ success: true, data: null });
+        }
+        res.json({ success: true, data: activeBatch });
+    } catch (err) {
+        console.error('[BATCH ACTIVE] Error:', err);
+        res.status(500).json({ success: false, message: "Failed to fetch active batch" });
+    }
+});
+
+// POST /api/batches — create new academic year (coordinator only)
+app.post("/api/batches", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { name, isActive } = req.body;
+    if (!name?.trim()) {
+        return res.status(400).json({ success: false, message: "Batch name is required (e.g., '2025-26')" });
+    }
+    try {
+        // Check if batch already exists
+        const existing = await batchesCollection.findOne({ name: name.trim() });
+        if (existing) {
+            return res.status(409).json({ success: false, message: "Academic year already exists" });
+        }
+        
+        // If this batch is active, deactivate all others
+        if (isActive) {
+            await batchesCollection.updateMany({}, { $set: { isActive: false } });
+        }
+        
+        const batch = {
+            name: name.trim(),
+            isActive: isActive || false,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+        
+        const result = await batchesCollection.insertOne(batch);
+        batch._id = result.insertedId;
+        
+        res.status(201).json({ success: true, message: "Academic year created", data: batch });
+    } catch (err) {
+        console.error('[BATCH CREATE] Error:', err);
+        res.status(500).json({ success: false, message: "Failed to create batch", error: err.message });
+    }
+});
+
+// PATCH /api/batches/:id/activate — set batch as active (coordinator only)
+app.patch("/api/batches/:id/activate", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    try {
+        const batchId = new ObjectId(req.params.id);
+        const batch = await batchesCollection.findOne({ _id: batchId });
+        
+        if (!batch) {
+            return res.status(404).json({ success: false, message: "Academic year not found" });
+        }
+        
+        // Deactivate all other batches
+        await batchesCollection.updateMany(
+            { _id: { $ne: batchId } }, 
+            { $set: { isActive: false, updatedAt: new Date() } }
+        );
+        
+        // Activate this batch
+        await batchesCollection.updateOne(
+            { _id: batchId },
+            { $set: { isActive: true, updatedAt: new Date() } }
+        );
+        
+        res.json({ success: true, message: `Academic year ${batch.name} is now active` });
+    } catch (err) {
+        console.error('[BATCH ACTIVATE] Error:', err);
+        res.status(500).json({ success: false, message: "Failed to activate batch" });
+    }
+});
+
+// DELETE /api/batches/:id — delete a batch (coordinator only)
+app.delete("/api/batches/:id", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    try {
+        const batchId = new ObjectId(req.params.id);
+        const batch = await batchesCollection.findOne({ _id: batchId });
+        
+        if (!batch) {
+            return res.status(404).json({ success: false, message: "Academic year not found" });
+        }
+        
+        // Check if batch is active
+        if (batch.isActive) {
+            return res.status(400).json({ 
+                success: false, 
+                message: "Cannot delete active academic year. Please activate another batch first." 
+            });
+        }
+        
+        // Check if any projects are assigned to this batch
+        const projectsCount = await projectsCollection.countDocuments({ batchId: batchId });
+        if (projectsCount > 0) {
+            return res.status(400).json({ 
+                success: false, 
+                message: `Cannot delete this academic year. ${projectsCount} project(s) are assigned to it.` 
+            });
+        }
+        
+        // Delete the batch
+        await batchesCollection.deleteOne({ _id: batchId });
+        
+        res.json({ success: true, message: `Academic year ${batch.name} deleted successfully` });
+    } catch (err) {
+        console.error('[BATCH DELETE] Error:', err);
+        res.status(500).json({ success: false, message: "Failed to delete batch" });
+    }
+});
+
 /*************** PROJECT ROUTES ***************/
 
 // Add project and assign mentor + mentee — coordinator only
@@ -1633,17 +1829,23 @@ app.patch("/api/assignments/:id/final-remark", requireRole('mentor'), async (req
       { $set: { finalRemark: finalRemark.trim(), finalRemarkedAt: new Date(), updatedAt: new Date() } }
     );
     
+    console.log('[FINAL REMARK] Marking project as completed for mentee:', assignment.menteeEmail);
+    
     // Mark project as completed in projects collection
-    await projectsCollection.updateOne(
-      { menteeEmail: assignment.menteeEmail },
+    const projectUpdateResult = await projectsCollection.updateOne(
+      { menteeEmail: assignment.menteeEmail, isArchived: { $ne: true } },
       { $set: { isCompleted: true, completedAt: new Date() } }
     );
+    
+    console.log('[FINAL REMARK] Project update result:', projectUpdateResult.modifiedCount, 'documents modified');
     
     // Mark project as completed in users collection
     await usersCollection.updateOne(
       { email: assignment.menteeEmail },
       { $set: { projectCompleted: true } }
     );
+    
+    console.log('[FINAL REMARK] Project marked as completed successfully');
     
     res.json({ success: true, message: 'Final remark saved' });
 
