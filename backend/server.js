@@ -1520,6 +1520,7 @@ app.get("/api/hod/project-details", verifyToken, checkRole('hod', 'project_coord
                     _id: a._id,
                     projectName: a.projectName,
                     duration,
+                    batchId: project?.batchId || null, // ADDED: Include batchId from project
                     mentor: mentor ? { email: mentor.email, name: mentor.name || '' } : { email: a.mentorEmail, name: '' },
                     mentee: mentee ? { email: mentee.email, name: mentee.name || '', rollNo: mentee.rollNo || '', contactNo: mentee.contactNo || '' } : { email: a.menteeEmail, name: '', rollNo: '', contactNo: '' },
                     groupMembers: mentee?.groupMembers || [],

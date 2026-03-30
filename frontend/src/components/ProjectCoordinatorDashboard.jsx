@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import axios from '../api/axiosInstance';
 import { useTheme } from '../context/ThemeContext';
-import ProjectsView from './ProjectsView';
 import { logout } from '../utils/auth';
+import { getAllowedPhases, PHASE_CONFIG } from '../utils/phases';
 
 const API = 'http://localhost:5000/api';
 
@@ -50,6 +50,13 @@ export default function ProjectCoordinatorDashboard() {
   const [batchForm, setBatchForm] = useState({ name: '', isActive: false });
   const [activeBatch, setActiveBatch] = useState(null);
   const [batchLoading, setBatchLoading] = useState(false);
+  
+  // Projects hierarchical view
+  const [expandedBatches, setExpandedBatches] = useState(new Set()); // Track which batches are expanded
+  const [expandedProjects, setExpandedProjects] = useState(new Set()); // Track which projects are expanded
+  const [menteeFiles, setMenteeFiles] = useState({}); // menteeEmail -> section map
+  const [filesLoading, setFilesLoading] = useState(null);
+  const [viewFile, setViewFile] = useState(null);
 
   // Assign form
   const [form, setForm] = useState({ menteeEmail: '', mentorEmail: '', duration: '6_months' });
@@ -64,6 +71,74 @@ export default function ProjectCoordinatorDashboard() {
   const [bulkLoading, setBulkLoading] = useState(false);
 
   const pcEmail = localStorage.getItem('userEmail') || localStorage.getItem('pcEmail') || 'coordinator@platform.com';
+
+  const toggleBatch = (batchId) => {
+    setExpandedBatches(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(batchId)) {
+        newSet.delete(batchId);
+      } else {
+        newSet.add(batchId);
+      }
+      return newSet;
+    });
+  };
+
+  const toggleProject = (projectId, menteeEmail) => {
+    setExpandedProjects(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(projectId)) {
+        newSet.delete(projectId);
+      } else {
+        newSet.add(projectId);
+        // Load files when expanding
+        if (menteeEmail) loadMenteeFiles(menteeEmail);
+      }
+      return newSet;
+    });
+  };
+
+  const loadMenteeFiles = async (menteeEmail) => {
+    if (!menteeEmail || menteeFiles[menteeEmail] !== undefined) return;
+    setFilesLoading(menteeEmail);
+    try {
+      const res = await axios.get(`${API}/files/metadata/${menteeEmail}`);
+      const map = {};
+      (res.data.data || []).forEach(f => {
+        map[f.section] = {
+          fileURL: f.file_url,
+          filename: f.file_name,
+          remark: f.remark,
+          timestamp: f.updatedAt,
+        };
+      });
+      setMenteeFiles(prev => ({ ...prev, [menteeEmail]: map }));
+    } catch {
+      setMenteeFiles(prev => ({ ...prev, [menteeEmail]: {} }));
+    } finally {
+      setFilesLoading(null);
+    }
+  };
+
+  const handleViewFile = async (fileURL, menteeEmail) => {
+    if (!fileURL) return;
+    try {
+      const res = await axios.post(`${API}/files/secure-url`, {
+        s3Key: fileURL,
+        menteeEmail,
+      });
+      if (res.data.success) setViewFile(res.data.url);
+    } catch (err) {
+      flash('Failed to load file', 'error');
+    }
+  };
+
+  const remarkColor = (r) => {
+    if (!r || r === 'Pending Review') return '#f59e0b';
+    if (r.toLowerCase().includes('approved')) return '#10b981';
+    if (r.toLowerCase().includes('reject')) return '#ef4444';
+    return 'var(--text-secondary)';
+  };
 
   const fetchProjects = () =>
     axios.get(`${API}/hod/project-details`).then(r => setProjects(r.data.data || [])).catch(() => {});
@@ -962,20 +1037,372 @@ student2@college.com,mentor2@college.com,1_year`}
           {/* ── ALL PROJECTS TAB ── */}
           {tab === 'projects' && (
             <div className="space-y-3">
+              {/* Refresh Button */}
               <div className="flex justify-end">
                 <button
                   onClick={fetchProjects}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium transition-all"
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium transition-all hover:scale-105"
                   style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}
                 >
                   🔄 Refresh
                 </button>
               </div>
-              <ProjectsView projects={projects} userEmail={pcEmail} userRole="project_coordinator" />
+
+              {/* Hierarchical View: Batches > Projects > Files */}
+              {batches.length === 0 ? (
+                <div className="glass rounded-2xl p-8 text-center" style={{ border: '1px solid rgba(236,72,153,0.12)' }}>
+                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                    No academic years found. Create one in the Academic Years tab.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {/* List all batches */}
+                  {batches.map(batch => {
+                    const batchProjects = projects.filter(p => p.batchId?.toString() === batch._id.toString());
+                    const isExpanded = expandedBatches.has(batch._id);
+                    
+                    return (
+                      <div key={batch._id} className="glass rounded-2xl overflow-hidden" style={{ border: '1px solid rgba(236,72,153,0.12)' }}>
+                        {/* Batch Header - Clickable */}
+                        <button
+                          onClick={() => toggleBatch(batch._id)}
+                          className="w-full px-5 py-4 flex items-center justify-between hover:bg-opacity-50 transition-all"
+                          style={{ background: isExpanded ? 'rgba(236,72,153,0.08)' : 'rgba(236,72,153,0.03)' }}
+                        >
+                          <div className="flex items-center gap-3">
+                            <span className="text-lg">{isExpanded ? '📂' : '📁'}</span>
+                            <div className="text-left">
+                              <h3 className="text-base font-bold" style={{ color: 'var(--text-primary)' }}>
+                                {batch.name}
+                                {batch.isActive && (
+                                  <span className="ml-2 text-xs px-2 py-0.5 rounded-full" style={{ background: 'rgba(16,185,129,0.15)', color: '#10b981' }}>
+                                    Active
+                                  </span>
+                                )}
+                              </h3>
+                              <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                                {batchProjects.length} project{batchProjects.length !== 1 ? 's' : ''}
+                              </p>
+                            </div>
+                          </div>
+                          <span className="text-xl" style={{ color: 'var(--text-muted)' }}>
+                            {isExpanded ? '▼' : '▶'}
+                          </span>
+                        </button>
+
+                        {/* Projects List - Shows when batch is expanded */}
+                        {isExpanded && (
+                          <div className="px-3 pb-3">
+                            {batchProjects.length === 0 ? (
+                              <div className="p-6 text-center" style={{ color: 'var(--text-muted)' }}>
+                                <p className="text-sm">No projects in this academic year yet.</p>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                {batchProjects.map(project => {
+                                  const isProjectExpanded = expandedProjects.has(project._id);
+                                  
+                                  return (
+                                    <div key={project._id} className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(236,72,153,0.08)' }}>
+                                      {/* Project Header - Clickable */}
+                                      <button
+                                        onClick={() => toggleProject(project._id, project.mentee?.email)}
+                                        className="w-full px-4 py-3 flex items-center justify-between hover:bg-opacity-50 transition-all"
+                                        style={{ background: isProjectExpanded ? 'rgba(99,102,241,0.08)' : 'rgba(255,255,255,0.02)' }}
+                                      >
+                                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                                          <span className="text-base">{isProjectExpanded ? '📄' : '📋'}</span>
+                                          <div className="text-left flex-1 min-w-0">
+                                            <h4 className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                                              {project.projectName}
+                                            </h4>
+                                            <div className="flex items-center gap-3 mt-0.5">
+                                              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                👤 {project.mentee?.name || project.mentee?.email}
+                                              </p>
+                                              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                🎓 {project.mentor?.name || project.mentor?.email}
+                                              </p>
+                                              <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: 'rgba(99,102,241,0.15)', color: '#818cf8' }}>
+                                                {project.duration === '1_year' ? '1 Year' : '6 Months'}
+                                              </span>
+                                            </div>
+                                          </div>
+                                        </div>
+                                        <span className="text-lg ml-2" style={{ color: 'var(--text-muted)' }}>
+                                          {isProjectExpanded ? '▼' : '▶'}
+                                        </span>
+                                      </button>
+
+                                      {/* Project Files - Shows when project is expanded */}
+                                      {isProjectExpanded && (
+                                        <div className="px-2 pb-2" style={{ borderTop: '1px solid rgba(236,72,153,0.08)' }}>
+                                          <div className="px-3 py-2 text-xs font-semibold uppercase tracking-wider"
+                                            style={{ background: 'rgba(236,72,153,0.04)', color: 'var(--text-muted)' }}>
+                                            File Submissions — {project.mentee?.email}
+                                            <span className="ml-3 normal-case font-normal px-2 py-0.5 rounded-full"
+                                              style={{ background: project.duration === '1_year' ? 'rgba(99,102,241,0.12)' : 'rgba(16,185,129,0.12)', color: project.duration === '1_year' ? '#818cf8' : '#10b981', border: `1px solid ${project.duration === '1_year' ? 'rgba(99,102,241,0.25)' : 'rgba(16,185,129,0.25)'}` }}>
+                                              🗓 {project.duration === '1_year' ? '1 Year' : '6 Months'}
+                                            </span>
+                                            {project.finalRemark && (
+                                              <span className="ml-3 normal-case font-normal px-2 py-0.5 rounded-full"
+                                                style={{ background: 'rgba(16,185,129,0.1)', color: '#10b981', border: '1px solid rgba(16,185,129,0.2)' }}>
+                                                ✅ {project.finalRemark}
+                                                {project.finalRemarkedAt && <> · {new Date(project.finalRemarkedAt).toLocaleDateString()}</>}
+                                              </span>
+                                            )}
+                                          </div>
+                                          {filesLoading === project.mentee?.email ? (
+                                            <div className="px-6 py-6 flex items-center gap-3" style={{ color: 'var(--text-muted)' }}>
+                                              <svg className="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                              </svg>
+                                              <span className="text-xs">Loading submissions...</span>
+                                            </div>
+                                          ) : (
+                                            <div className="overflow-x-auto">
+                                              <table className="w-full text-sm" style={{ minWidth: '600px' }}>
+                                                <thead>
+                                                  <tr style={{ background: 'rgba(0,0,0,0.1)' }}>
+                                                    {['Stage', 'Status', 'Mentor Remark', 'Uploaded On', 'Action'].map(h => (
+                                                      <th key={h} className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider"
+                                                        style={{ color: 'var(--text-muted)' }}>{h}</th>
+                                                    ))}
+                                                  </tr>
+                                                </thead>
+                                                <tbody>
+                                                  {getAllowedPhases(project.duration).map(key => {
+                                                    const upload = (menteeFiles[project.mentee?.email] || {})[key];
+                                                    return (
+                                                      <tr key={key} style={{ borderBottom: '1px solid rgba(236,72,153,0.06)', opacity: upload ? 1 : 0.4 }}>
+                                                        <td className="px-4 py-2.5 text-sm" style={{ color: 'var(--text-primary)' }}>
+                                                          {PHASE_CONFIG[key]?.label ?? key}
+                                                        </td>
+                                                        <td className="px-4 py-2.5">
+                                                          {upload
+                                                            ? <span className="text-xs px-2 py-1 rounded-lg" style={{ background: 'rgba(16,185,129,0.1)', color: '#10b981' }}>Uploaded</span>
+                                                            : <span className="text-xs px-2 py-1 rounded-lg" style={{ background: 'rgba(255,255,255,0.05)', color: 'var(--text-muted)' }}>Pending</span>
+                                                          }
+                                                        </td>
+                                                        <td className="px-4 py-2.5 text-xs" style={{ color: remarkColor(upload?.remark) }}>
+                                                          {upload?.remark || '—'}
+                                                        </td>
+                                                        <td className="px-4 py-2.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                          {upload?.timestamp ? new Date(upload.timestamp).toLocaleDateString() : '—'}
+                                                        </td>
+                                                        <td className="px-4 py-2.5">
+                                                          {upload && (
+                                                            <button
+                                                              onClick={() => handleViewFile(upload.fileURL, project.mentee?.email)}
+                                                              className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5"
+                                                              style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}
+                                                            >
+                                                              🔒 View
+                                                            </button>
+                                                          )}
+                                                        </td>
+                                                      </tr>
+                                                    );
+                                                  })}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {/* Unassigned Projects Section */}
+                  {(() => {
+                    const unassignedProjects = projects.filter(p => !p.batchId);
+                    if (unassignedProjects.length === 0) return null;
+                    
+                    const isExpanded = expandedBatches.has('unassigned');
+                    
+                    return (
+                      <div className="glass rounded-2xl overflow-hidden" style={{ border: '1px solid rgba(239,68,68,0.12)' }}>
+                        <button
+                          onClick={() => toggleBatch('unassigned')}
+                          className="w-full px-5 py-4 flex items-center justify-between hover:bg-opacity-50 transition-all"
+                          style={{ background: isExpanded ? 'rgba(239,68,68,0.08)' : 'rgba(239,68,68,0.03)' }}
+                        >
+                          <div className="flex items-center gap-3">
+                            <span className="text-lg">⚠️</span>
+                            <div className="text-left">
+                              <h3 className="text-base font-bold" style={{ color: 'var(--text-primary)' }}>
+                                Unassigned (No Academic Year)
+                              </h3>
+                              <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                                {unassignedProjects.length} project{unassignedProjects.length !== 1 ? 's' : ''} - Created before batch system
+                              </p>
+                            </div>
+                          </div>
+                          <span className="text-xl" style={{ color: 'var(--text-muted)' }}>
+                            {isExpanded ? '▼' : '▶'}
+                          </span>
+                        </button>
+
+                        {isExpanded && (
+                          <div className="px-3 pb-3">
+                            <div className="space-y-2">
+                              {unassignedProjects.map(project => {
+                                const isProjectExpanded = expandedProjects.has(project._id);
+                                
+                                return (
+                                  <div key={project._id} className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(236,72,153,0.08)' }}>
+                                    <button
+                                      onClick={() => toggleProject(project._id, project.mentee?.email)}
+                                      className="w-full px-4 py-3 flex items-center justify-between hover:bg-opacity-50 transition-all"
+                                      style={{ background: isProjectExpanded ? 'rgba(99,102,241,0.08)' : 'rgba(255,255,255,0.02)' }}
+                                    >
+                                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                                        <span className="text-base">{isProjectExpanded ? '📄' : '📋'}</span>
+                                        <div className="text-left flex-1 min-w-0">
+                                          <h4 className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                                            {project.projectName}
+                                          </h4>
+                                          <div className="flex items-center gap-3 mt-0.5">
+                                            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                                              👤 {project.mentee?.name || project.mentee?.email}
+                                            </p>
+                                            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                                              🎓 {project.mentor?.name || project.mentor?.email}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <span className="text-lg ml-2" style={{ color: 'var(--text-muted)' }}>
+                                        {isProjectExpanded ? '▼' : '▶'}
+                                      </span>
+                                    </button>
+
+                                    {isProjectExpanded && (
+                                      <div className="px-2 pb-2" style={{ borderTop: '1px solid rgba(236,72,153,0.08)' }}>
+                                        <div className="px-3 py-2 text-xs font-semibold uppercase tracking-wider"
+                                          style={{ background: 'rgba(236,72,153,0.04)', color: 'var(--text-muted)' }}>
+                                          File Submissions — {project.mentee?.email}
+                                          {project.duration && (
+                                            <span className="ml-3 normal-case font-normal px-2 py-0.5 rounded-full"
+                                              style={{ background: project.duration === '1_year' ? 'rgba(99,102,241,0.12)' : 'rgba(16,185,129,0.12)', color: project.duration === '1_year' ? '#818cf8' : '#10b981', border: `1px solid ${project.duration === '1_year' ? 'rgba(99,102,241,0.25)' : 'rgba(16,185,129,0.25)'}` }}>
+                                              🗓 {project.duration === '1_year' ? '1 Year' : '6 Months'}
+                                            </span>
+                                          )}
+                                          {project.finalRemark && (
+                                            <span className="ml-3 normal-case font-normal px-2 py-0.5 rounded-full"
+                                              style={{ background: 'rgba(16,185,129,0.1)', color: '#10b981', border: '1px solid rgba(16,185,129,0.2)' }}>
+                                              ✅ {project.finalRemark}
+                                              {project.finalRemarkedAt && <> · {new Date(project.finalRemarkedAt).toLocaleDateString()}</>}
+                                            </span>
+                                          )}
+                                        </div>
+                                        {filesLoading === project.mentee?.email ? (
+                                          <div className="px-6 py-6 flex items-center gap-3" style={{ color: 'var(--text-muted)' }}>
+                                            <svg className="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+                                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                            </svg>
+                                            <span className="text-xs">Loading submissions...</span>
+                                          </div>
+                                        ) : (
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-sm" style={{ minWidth: '600px' }}>
+                                              <thead>
+                                                <tr style={{ background: 'rgba(0,0,0,0.1)' }}>
+                                                  {['Stage', 'Status', 'Mentor Remark', 'Uploaded On', 'Action'].map(h => (
+                                                    <th key={h} className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wider"
+                                                      style={{ color: 'var(--text-muted)' }}>{h}</th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {getAllowedPhases(project.duration || '6_months').map(key => {
+                                                  const upload = (menteeFiles[project.mentee?.email] || {})[key];
+                                                  return (
+                                                    <tr key={key} style={{ borderBottom: '1px solid rgba(236,72,153,0.06)', opacity: upload ? 1 : 0.4 }}>
+                                                      <td className="px-4 py-2.5 text-sm" style={{ color: 'var(--text-primary)' }}>
+                                                        {PHASE_CONFIG[key]?.label ?? key}
+                                                      </td>
+                                                      <td className="px-4 py-2.5">
+                                                        {upload
+                                                          ? <span className="text-xs px-2 py-1 rounded-lg" style={{ background: 'rgba(16,185,129,0.1)', color: '#10b981' }}>Uploaded</span>
+                                                          : <span className="text-xs px-2 py-1 rounded-lg" style={{ background: 'rgba(255,255,255,0.05)', color: 'var(--text-muted)' }}>Pending</span>
+                                                        }
+                                                      </td>
+                                                      <td className="px-4 py-2.5 text-xs" style={{ color: remarkColor(upload?.remark) }}>
+                                                        {upload?.remark || '—'}
+                                                      </td>
+                                                      <td className="px-4 py-2.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                        {upload?.timestamp ? new Date(upload.timestamp).toLocaleDateString() : '—'}
+                                                      </td>
+                                                      <td className="px-4 py-2.5">
+                                                        {upload && (
+                                                          <button
+                                                            onClick={() => handleViewFile(upload.fileURL, project.mentee?.email)}
+                                                            className="text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5"
+                                                            style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}
+                                                          >
+                                                            🔒 View
+                                                          </button>
+                                                        )}
+                                                      </td>
+                                                    </tr>
+                                                  );
+                                                })}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
           )}
         </div>
       </main>
+
+      {/* Secure file viewer modal */}
+      {viewFile && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)' }}
+          onClick={() => setViewFile(null)}>
+          <div className="w-full max-w-5xl rounded-2xl overflow-hidden flex flex-col"
+            style={{ height: '85vh', border: '1px solid rgba(236,72,153,0.25)' }}
+            onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-3 shrink-0"
+              style={{ background: 'linear-gradient(135deg,rgba(236,72,153,0.15),rgba(168,85,247,0.15))', borderBottom: '1px solid rgba(236,72,153,0.2)' }}>
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full" style={{ background: '#ec4899', boxShadow: '0 0 6px #ec4899' }} />
+                <span className="text-xs font-medium" style={{ color: '#f472b6' }}>🔒 Secure File Viewer — expires in 5 min</span>
+              </div>
+              <button onClick={() => setViewFile(null)}
+                className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold"
+                style={{ background: 'rgba(239,68,68,0.8)', color: '#fff' }}>✕</button>
+            </div>
+            <iframe src={viewFile} className="w-full flex-1 border-0" title="Secure File Viewer" />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
