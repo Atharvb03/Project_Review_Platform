@@ -1,0 +1,1938 @@
+const express = require("express");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const multer = require("multer");
+const AWS = require("aws-sdk");
+const crypto = require("crypto");
+require("dotenv").config();
+
+const { MongoClient, ObjectId } = require("mongodb");
+const { verifyToken, checkRole, requireRole } = require("./middleware/auth");
+const { generateToken } = require("./utils/jwt");
+const bcrypt = require("bcryptjs");
+const { COLLECTION: FILE_COL, ALLOWED_EXTENSIONS, MAX_SIZE_MB, MIME_MAP } = require("./models/fileMetadata");
+const { getUploadUrl, getDownloadUrl } = require("./controllers/s3Controller");
+// ADDED: centralized phase config
+const { getAllowedPhases } = require("./constants/phases");
+// ADDED: email service
+const {
+  sendEmail,
+  remarkAddedEmail,
+  finalRemarkEmail,
+  deadlineSetEmail,
+  deadlineExtendedEmail,
+  fileUploadedEmail,
+  assignmentCreatedMenteeEmail,
+  assignmentCreatedMentorEmail,
+  phaseApprovedEmail,
+  mentorChangedOldMentorEmail,
+  mentorChangedNewMentorEmail,
+  mentorChangedMenteeEmail,
+} = require("./utils/emailService");
+// ADDED: deadline reminder cron job
+const { initDeadlineReminder } = require("./jobs/deadlineReminder");
+
+const app = express();
+const PORT = 5000;
+const mongoURI = "mongodb://127.0.0.1:27017";
+
+// Middleware
+app.use(bodyParser.json());
+app.use(cors({
+    origin: "http://localhost:5173",
+    credentials: true
+}));
+
+// MongoDB Setup (keep only users and projects collections)
+const client = new MongoClient(mongoURI);
+let db, usersCollection, projectsCollection;
+
+async function connectDB() {
+    try {
+        await client.connect();
+        db = client.db("project_management");
+        usersCollection = db.collection("users");
+        projectsCollection = db.collection("projects");
+        console.log("✅ Connected to MongoDB");
+        // Start deadline reminder cron job after DB is ready
+        initDeadlineReminder(db, usersCollection);
+    } catch (err) {
+        console.error("❌ MongoDB connection error:", err);
+    }
+}
+connectDB();
+
+// AWS S3 Setup
+const s3 = new AWS.S3({
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    region: process.env.AWS_REGION
+});
+
+// ── S3 helper: extract key from any S3 URL ──────────────────────────────────
+function extractS3Key(fileUrl) {
+  const bucket = process.env.S3_BUCKET_NAME;
+  const region = process.env.AWS_REGION;
+  const patterns = [
+    `https://${bucket}.s3.${region}.amazonaws.com/`,
+    `https://${bucket}.s3.amazonaws.com/`,
+    `https://s3.${region}.amazonaws.com/${bucket}/`,
+    `https://s3.amazonaws.com/${bucket}/`,
+  ];
+  for (const p of patterns) {
+    if (fileUrl.startsWith(p)) return decodeURIComponent(fileUrl.slice(p.length));
+  }
+  // Fallback: parse pathname
+  const url = new URL(fileUrl);
+  let key = url.pathname.startsWith('/') ? url.pathname.slice(1) : url.pathname;
+  if (key.startsWith(bucket + '/')) key = key.slice(bucket.length + 1);
+  return decodeURIComponent(key);
+}
+
+/*************** FILE ROUTES (Pre-signed S3) ***************/
+
+/**
+ * POST /api/files/generate-upload-url
+ * Roles: mentee
+ * Body: { fileName, fileType, section, menteeEmail }
+ * Returns: { uploadUrl (PUT), s3Key, objectUrl }
+ */
+app.post('/api/files/generate-upload-url', requireRole('mentee'), async (req, res) => {
+  const { fileName, fileType, section, menteeEmail } = req.body;
+
+  if (!fileName || !section || !menteeEmail) {
+    return res.status(400).json({ success: false, message: 'fileName, section and menteeEmail are required' });
+  }
+
+  // Validate extension
+  const ext = fileName.split('.').pop().toLowerCase();
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    return res.status(400).json({
+      success: false,
+      message: `File type .${ext} not allowed. Allowed: ${ALLOWED_EXTENSIONS.join(', ')}`,
+    });
+  }
+
+  // Resolve content type: prefer browser-supplied, fall back to MIME_MAP
+  const resolvedContentType = (fileType && fileType !== 'application/octet-stream')
+    ? fileType
+    : (MIME_MAP[ext] || 'application/octet-stream');
+
+  // Verify mentee has an assignment
+  const assignment = await db.collection('assignments').findOne({ menteeEmail: menteeEmail.toLowerCase() });
+  if (!assignment) {
+    return res.status(403).json({ success: false, message: 'Your project is not yet assigned to a mentor. Please wait for the coordinator to assign a mentor before uploading files.' });
+  }
+
+  // Block upload if project has been finalised by mentor
+  if (assignment.finalRemark) {
+    return res.status(403).json({ success: false, message: 'Your project has been finalised by your mentor. Uploads are no longer accepted.' });
+  }
+
+  // ADDED: validate phase against project duration
+  const project = await projectsCollection.findOne({ menteeEmail: menteeEmail.toLowerCase() });
+  const duration = project?.duration || assignment?.duration || '6_months';
+  const allowedPhases = getAllowedPhases(duration);
+  if (!allowedPhases.includes(section)) {
+    return res.status(400).json({
+      success: false,
+      message: `This phase is not allowed for this project duration (${duration.replace('_', ' ')})`,
+    });
+  }
+
+  // Unique S3 key — private bucket, no public access
+  const uniqueId = crypto.randomBytes(8).toString('hex');
+  const safeFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const s3Key = `uploads/${assignment._id}/${section}/${uniqueId}_${safeFileName}`;
+
+  const params = {
+    Bucket:      process.env.S3_BUCKET_NAME,
+    Key:         s3Key,
+    ContentType: resolvedContentType,
+    Expires:     300, // 5 min window to complete the PUT
+    // NOTE: Do NOT add ContentDisposition here — it becomes a required signed
+    // header and the browser XHR won't send it, causing a SignatureDoesNotMatch error.
+  };
+
+  try {
+    const uploadUrl = s3.getSignedUrl('putObject', params);
+    const objectUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodeURIComponent(s3Key).replace(/%2F/g, '/')}`;
+    res.json({ success: true, uploadUrl, s3Key, objectUrl, contentType: resolvedContentType });
+  } catch (err) {
+    console.error('Pre-signed PUT error:', err);
+    res.status(500).json({ success: false, message: 'Failed to generate upload URL' });
+  }
+});
+
+/**
+ * POST /api/files/save-metadata
+ * Roles: mentee
+ * Body: { fileName, s3Key, fileType, section, menteeEmail }
+ * Saves file metadata to DB after successful S3 PUT
+ */
+app.post('/api/files/save-metadata', requireRole('mentee'), async (req, res) => {
+  const { fileName, s3Key, fileType, section, menteeEmail } = req.body;
+
+  if (!fileName || !s3Key || !fileType || !section || !menteeEmail) {
+    return res.status(400).json({ success: false, message: 'All fields are required' });
+  }
+
+  try {
+    const assignment = await db.collection('assignments').findOne({ menteeEmail: menteeEmail.toLowerCase() });
+    if (!assignment) {
+      return res.status(403).json({ success: false, message: 'No assignment found for this mentee' });
+    }
+
+    const fileCol = db.collection(FILE_COL);
+    const now = new Date();
+
+    // Compute finalDeadline: extendedDeadline takes priority over original deadline
+    const finalDeadline = assignment.extendedDeadline
+      ? new Date(assignment.extendedDeadline)
+      : assignment.deadline
+        ? new Date(assignment.deadline)
+        : null;
+
+    const isLate = finalDeadline ? now > finalDeadline : false;
+    const submissionStatus = isLate ? 'Late Submission' : 'Submitted';
+
+    // Upsert: replace existing metadata for same mentee+section
+    await fileCol.updateOne(
+      { uploaded_by: menteeEmail.toLowerCase(), section },
+      {
+        $set: {
+          file_name:   fileName,
+          file_url:    s3Key,
+          file_type:   fileType,
+          section,
+          project_id:  assignment._id.toString(),
+          uploaded_by: menteeEmail.toLowerCase(),
+          remark:      'Pending Review',
+          submittedAt: now,
+          isLate,
+          submissionStatus,
+          updatedAt:   now,
+        },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true }
+    );
+
+    res.json({ success: true, message: 'File metadata saved' });
+
+    // Fire-and-forget: email mentor about new upload
+    setImmediate(async () => {
+      try {
+        const mentee = await usersCollection.findOne({ email: menteeEmail.toLowerCase() });
+        const mentor = await usersCollection.findOne({ email: assignment.mentorEmail });
+        const { PHASE_CONFIG } = require('./constants/phases');
+        const phaseName = PHASE_CONFIG[section]?.label || section;
+        if (mentor?.email) {
+          const tpl = fileUploadedEmail({
+            menteeName:  mentee?.name || menteeEmail,
+            menteeEmail: menteeEmail.toLowerCase(),
+            projectName: assignment.projectName || 'Your Project',
+            phaseName,
+          });
+          await sendEmail({ to: mentor.email, ...tpl });
+        }
+      } catch (e) { console.error('[Email] save-metadata trigger:', e.message); }
+    });
+  } catch (err) {
+    console.error('Save metadata error:', err);
+    res.status(500).json({ success: false, message: 'Failed to save metadata' });
+  }
+});
+
+/**
+ * POST /api/files/secure-url
+ * Roles: mentee (own files), mentor (assigned mentees), hod
+ * Body: { s3Key, menteeEmail }
+ * Returns a pre-signed GET URL valid for 5 minutes
+ */
+app.post('/api/files/secure-url', requireRole('mentee', 'mentor', 'hod', 'project_coordinator'), async (req, res) => {
+  const { s3Key, menteeEmail, download, fileName } = req.body;
+
+  if (!s3Key || !menteeEmail) {
+    return res.status(400).json({ success: false, message: 's3Key and menteeEmail are required' });
+  }
+
+  try {
+    const assignment = await db.collection('assignments').findOne({ menteeEmail: menteeEmail.toLowerCase() });
+
+    // Access control
+    const role  = req.userRole;
+    const email = req.userEmail;
+
+    if (role === 'mentee' && email !== menteeEmail.toLowerCase()) {
+      return res.status(403).json({ success: false, message: 'You can only access your own files' });
+    }
+
+    if (role === 'mentor') {
+      if (!assignment || assignment.mentorEmail !== email) {
+        return res.status(403).json({ success: false, message: 'You are not the assigned mentor for this mentee' });
+      }
+    }
+
+    // HOD and PC have unrestricted read access
+
+    const params = {
+      Bucket:  process.env.S3_BUCKET_NAME,
+      Key:     s3Key,
+      Expires: role === 'mentee' ? 300 : 604800, // mentee: 5min | mentor/hod/pc: 7 days
+    };
+
+    // Force browser download instead of inline preview
+    if (download) {
+      const safeFileName = (fileName || s3Key.split('/').pop() || 'download').replace(/[^a-zA-Z0-9._-]/g, '_');
+      params.ResponseContentDisposition = `attachment; filename="${safeFileName}"`;
+    }
+
+    const signedUrl = s3.getSignedUrl('getObject', params);
+    res.json({ success: true, url: signedUrl });
+  } catch (err) {
+    console.error('Secure URL error:', err);
+    res.status(500).json({ success: false, message: 'Failed to generate secure URL' });
+  }
+});
+
+/**
+ * GET /api/files/metadata/:menteeEmail
+ * Roles: mentee (own), mentor (assigned), hod, project_coordinator
+ * Returns all file metadata for a mentee
+ */
+app.get('/api/files/metadata/:menteeEmail', requireRole('mentee', 'mentor', 'hod', 'project_coordinator'), async (req, res) => {
+  const menteeEmail = req.params.menteeEmail.toLowerCase();
+
+  try {
+    const assignment = await db.collection('assignments').findOne({ menteeEmail });
+    const role  = req.userRole;
+    const email = req.userEmail;
+
+    if (role === 'mentee' && email !== menteeEmail) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+    if (role === 'mentor' && (!assignment || assignment.mentorEmail !== email)) {
+      return res.status(403).json({ success: false, message: 'You are not the assigned mentor for this mentee' });
+    }
+
+    const files = await db.collection(FILE_COL).find({ uploaded_by: menteeEmail }).toArray();
+    res.json({
+      success: true,
+      data: files,
+      deadline: assignment?.deadline || null,
+      extendedDeadline: assignment?.extendedDeadline || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch metadata' });
+  }
+});
+
+/**
+ * DELETE /api/files/metadata
+ * Roles: mentee (own files only)
+ * Body: { menteeEmail, section }
+ */
+app.delete('/api/files/metadata', requireRole('mentee'), async (req, res) => {
+  const { menteeEmail, section } = req.body;
+  if (!menteeEmail || !section) {
+    return res.status(400).json({ success: false, message: 'menteeEmail and section are required' });
+  }
+  if (req.userEmail !== menteeEmail.toLowerCase()) {
+    return res.status(403).json({ success: false, message: 'You can only delete your own files' });
+  }
+  try {
+    // Block delete if project has been finalised
+    const assignment = await db.collection('assignments').findOne({ menteeEmail: menteeEmail.toLowerCase() });
+    if (assignment?.finalRemark) {
+      return res.status(403).json({ success: false, message: 'Your project has been finalised. Files cannot be deleted.' });
+    }
+    await db.collection(FILE_COL).deleteOne({ uploaded_by: menteeEmail.toLowerCase(), section });
+    res.json({ success: true, message: 'File metadata removed' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to delete metadata' });
+  }
+});
+
+/**
+ * PATCH /api/files/remark
+ * Roles: mentor only
+ * Body: { menteeEmail, section, remark }
+ */
+app.patch('/api/files/remark', requireRole('mentor'), async (req, res) => {
+  const { menteeEmail, section, remark } = req.body;
+
+  if (!menteeEmail || !section || !remark) {
+    return res.status(400).json({ success: false, message: 'menteeEmail, section and remark are required' });
+  }
+
+  try {
+    const assignment = await db.collection('assignments').findOne({ menteeEmail: menteeEmail.toLowerCase() });
+    if (!assignment || assignment.mentorEmail !== req.userEmail) {
+      return res.status(403).json({ success: false, message: 'You are not the assigned mentor for this mentee' });
+    }
+
+    // Block remarks after final remark is submitted
+    if (assignment.finalRemark) {
+      return res.status(403).json({ success: false, message: 'Project has been finalised. No further remarks can be added.' });
+    }
+
+    const result = await db.collection(FILE_COL).updateOne(
+      { uploaded_by: menteeEmail.toLowerCase(), section },
+      { $set: { remark, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: 'File not found for this section' });
+    }
+
+    res.json({ success: true, message: 'Remark updated' });
+
+    // Fire-and-forget: notify mentee + in-app notification
+    setImmediate(async () => {
+      try {
+        const mentee = await usersCollection.findOne({ email: menteeEmail.toLowerCase() });
+        const { PHASE_CONFIG } = require('./constants/phases');
+        const phaseName = PHASE_CONFIG[section]?.label || section;
+        // In-app notification
+        await db.collection('notifications').insertOne({
+          recipientEmail: menteeEmail.toLowerCase(),
+          recipientRole: 'mentee',
+          message: `Your mentor added a remark on "${phaseName}": ${remark}`,
+          read: false,
+          createdAt: new Date(),
+        });
+        // Email — remark added
+        if (mentee?.email) {
+          const tpl = remarkAddedEmail({
+            menteeName:  mentee.name || menteeEmail,
+            projectName: assignment.projectName || 'Your Project',
+            phaseName,
+            remark,
+          });
+          await sendEmail({ to: mentee.email, ...tpl });
+          // Extra email if remark is an approval
+          if (remark.toLowerCase().includes('approved') || remark.toLowerCase().includes('approve')) {
+            const approvalTpl = phaseApprovedEmail({
+              menteeName:  mentee.name || menteeEmail,
+              projectName: assignment.projectName || 'Your Project',
+              phaseName,
+            });
+            await sendEmail({ to: mentee.email, ...approvalTpl });
+          }
+        }
+      } catch (e) { console.error('[Email] remark trigger:', e.message); }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to update remark' });
+  }
+});
+
+// Legacy fallback: direct upload — deprecated, kept for backward compat
+const uploadToMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_SIZE_MB * 1024 * 1024 } });
+app.post('/api/files/upload', verifyToken, uploadToMemory.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file provided' });
+
+  const ext = req.file.originalname.split('.').pop().toLowerCase();
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    return res.status(400).json({ success: false, message: `File type .${ext} not allowed` });
+  }
+
+  const s3Key = `uploads/legacy/${Date.now()}_${req.file.originalname}`;
+  const params = {
+    Bucket:      process.env.S3_BUCKET_NAME,
+    Key:         s3Key,
+    Body:        req.file.buffer,
+    ContentType: req.file.mimetype,
+  };
+
+  try {
+    await s3.upload(params).promise();
+    // Return the S3 key as url so existing frontend still works
+    const objectUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}`;
+    res.status(200).json({ success: true, message: 'File uploaded', url: objectUrl, s3Key });
+  } catch (err) {
+    console.error('Legacy upload error:', err);
+    res.status(500).json({ success: false, message: 'S3 upload failed', error: err.message });
+  }
+});
+
+/*************** USER ROUTES ***************/
+
+// Signup
+app.post("/api/signup", async (req, res) => {
+    try {
+        const { name, email, password, role, rollNo, contactNo, inviteCode } = req.body;
+
+        if (!name?.trim() || !email || !password || !role) {
+            return res.status(400).json({ success: false, message: "name, email, password and role are required" });
+        }
+
+        // ── Role access control ──────────────────────────────────────────────
+        const VALID_ROLES = ['mentee', 'mentor', 'project_coordinator', 'hod'];
+
+        if (!VALID_ROLES.includes(role)) {
+            console.warn(`[SIGNUP] Unknown role attempt: "${role}" — email: ${email}`);
+            return res.status(400).json({ success: false, message: "Invalid role selected." });
+        }
+
+        // ── Invite code validation for protected roles ───────────────────────
+        if (role === 'mentor') {
+            if (!inviteCode?.trim() || inviteCode.trim() !== process.env.MENTOR_INVITE_CODE) {
+                console.warn(`[SIGNUP] Invalid mentor invite code — email: ${email}`);
+                return res.status(403).json({ success: false, message: "Invalid invite code." });
+            }
+        }
+
+        if (role === 'project_coordinator') {
+            if (!inviteCode?.trim() || inviteCode.trim() !== process.env.COORD_CODE) {
+                console.warn(`[SIGNUP] Invalid coordinator invite code — email: ${email}`);
+                return res.status(403).json({ success: false, message: "Invalid invite code." });
+            }
+        }
+
+        if (role === 'hod') {
+            // Check if any HOD already exists
+            const existingHOD = await usersCollection.findOne({
+                $or: [{ role: 'hod' }, { roles: 'hod' }]
+            });
+            if (existingHOD) {
+                // HOD exists — require HOD_CODE to add another (admin override)
+                if (!inviteCode?.trim() || inviteCode.trim() !== process.env.HOD_CODE) {
+                    console.warn(`[SIGNUP] HOD already exists, blocked attempt — email: ${email}`);
+                    return res.status(403).json({ success: false, message: "HOD already exists. Contact administrator." });
+                }
+            }
+            // No HOD yet — first HOD can sign up freely (no code required)
+        }
+
+        const normalizedEmail = email.toLowerCase();
+        const existingUser    = await usersCollection.findOne({ email: normalizedEmail });
+        const hashedPassword  = await bcrypt.hash(password, 10);
+
+        // ── Mentee: single-role, one account per email ───────────────────────
+        if (role === 'mentee') {
+            if (existingUser) {
+                return res.status(400).json({ success: false, message: "User already exists" });
+            }
+            await usersCollection.insertOne({
+                name: name.trim(),
+                email: normalizedEmail,
+                password: hashedPassword,
+                role: 'mentee',
+                roles: ['mentee'],
+                rollNo: rollNo?.trim() || '',
+                contactNo: contactNo?.toString().trim() || '',
+                projectStatus: 'pending',
+            });
+            return res.status(201).json({ success: true, message: "Account created successfully. You can now log in." });
+        }
+
+        // ── Mentor: multi-role merge on same email ───────────────────────────
+        if (existingUser) {
+            const passwordMatch = existingUser.password.startsWith('$2')
+                ? await bcrypt.compare(password, existingUser.password)
+                : existingUser.password === password;
+            if (!passwordMatch) {
+                return res.status(400).json({ success: false, message: "Email already registered with a different password." });
+            }
+            const currentRoles = existingUser.roles || [existingUser.role];
+            if (currentRoles.includes(role)) {
+                return res.status(400).json({ success: false, message: `You are already registered as ${role}.` });
+            }
+            await usersCollection.updateOne(
+                { email: normalizedEmail },
+                { $addToSet: { roles: role } }
+            );
+            const updatedRoles = [...currentRoles, role];
+            const token = generateToken({ email: normalizedEmail, roles: updatedRoles, name: existingUser.name || '' }, role);
+            return res.status(200).json({
+                success: true,
+                message: `Role '${role}' added. Please re-login to continue with your new role.`,
+                token,
+                roles: updatedRoles,
+                requireReLogin: true,
+            });
+        }
+
+        // New account (mentor / coordinator / hod)
+        await usersCollection.insertOne({
+            name: name.trim(),
+            email: normalizedEmail,
+            password: hashedPassword,
+            role,
+            roles: [role],
+        });
+        res.status(201).json({ success: true, message: "Account created successfully. You can now log in." });
+
+    } catch (err) {
+        console.error("Signup error:", err);
+        res.status(500).json({ success: false, message: "Internal server error" });
+    }
+});
+
+// POST /api/mentee/create-project — mentee creates a new project with details and members
+app.post("/api/mentee/create-project", requireRole('mentee'), async (req, res) => {
+    console.log('[CREATE PROJECT] Request received');
+    console.log('[CREATE PROJECT] Body:', req.body);
+    console.log('[CREATE PROJECT] User email:', req.userEmail);
+    
+    const { projectName, projectDuration, description, groupMembers } = req.body;
+    
+    if (!projectName?.trim()) {
+        console.log('[CREATE PROJECT] Validation failed: Project name missing');
+        return res.status(400).json({ success: false, message: "Project name is required" });
+    }
+    if (!projectDuration) {
+        console.log('[CREATE PROJECT] Validation failed: Duration missing');
+        return res.status(400).json({ success: false, message: "Project duration is required" });
+    }
+    if (!['6_months', '1_year'].includes(projectDuration)) {
+        console.log('[CREATE PROJECT] Validation failed: Invalid duration');
+        return res.status(400).json({ success: false, message: "Invalid project duration" });
+    }
+    
+    // Validate group members if provided
+    if (groupMembers && !Array.isArray(groupMembers)) {
+        return res.status(400).json({ success: false, message: "groupMembers must be an array" });
+    }
+    if (groupMembers && groupMembers.length > 5) {
+        return res.status(400).json({ success: false, message: "Maximum 5 group members allowed" });
+    }
+    if (groupMembers) {
+        for (const m of groupMembers) {
+            if (!m.name?.trim()) {
+                return res.status(400).json({ success: false, message: "Each member must have a name" });
+            }
+        }
+        // Check for duplicate emails (ignore empty emails)
+        const emails = groupMembers.map(m => m.email?.toLowerCase()).filter(Boolean);
+        if (new Set(emails).size !== emails.length) {
+            return res.status(400).json({ success: false, message: "Duplicate member emails are not allowed" });
+        }
+    }
+    
+    try {
+        const user = await usersCollection.findOne({ email: req.userEmail });
+        if (!user) {
+            console.log('[CREATE PROJECT] User not found');
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+        
+        console.log('[CREATE PROJECT] User found:', user.email);
+        console.log('[CREATE PROJECT] Existing project name:', user.projectName);
+        
+        // Check if project already exists
+        if (user.projectName) {
+            console.log('[CREATE PROJECT] Project already exists');
+            return res.status(400).json({ success: false, message: "Project already created. You can only create one project." });
+        }
+        
+        // Check if already assigned
+        const assignment = await db.collection('assignments').findOne({ menteeEmail: req.userEmail });
+        if (assignment) {
+            console.log('[CREATE PROJECT] Already assigned to mentor');
+            return res.status(403).json({ success: false, message: "Cannot modify project after mentor assignment" });
+        }
+        
+        // Sanitize group members
+        const sanitizedMembers = groupMembers ? groupMembers.map(m => ({
+            name: m.name.trim(),
+            email: m.email?.trim().toLowerCase() || '',
+            rollNo: m.rollNo?.trim() || '',
+            contactNo: m.contactNo?.toString().trim() || '',
+        })) : [];
+        
+        console.log('[CREATE PROJECT] Updating user document...');
+        
+        // Update user with project details
+        await usersCollection.updateOne(
+            { email: req.userEmail },
+            {
+                $set: {
+                    projectName: projectName.trim(),
+                    projectDuration: projectDuration,
+                    projectDescription: description?.trim() || '',
+                    groupMembers: sanitizedMembers,
+                    projectStatus: 'pending',
+                    projectCreatedAt: new Date(),
+                }
+            }
+        );
+        
+        console.log('[CREATE PROJECT] User document updated');
+        console.log('[CREATE PROJECT] Updating projects collection...');
+        
+        // Also create/update in projects collection
+        await projectsCollection.updateOne(
+            { menteeEmail: req.userEmail },
+            {
+                $set: {
+                    menteeEmail: req.userEmail,
+                    menteeName: user.name,
+                    projectName: projectName.trim(),
+                    duration: projectDuration,
+                    description: description?.trim() || '',
+                    groupMembers: sanitizedMembers,
+                    status: 'pending',
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                }
+            },
+            { upsert: true }
+        );
+        
+        console.log('[CREATE PROJECT] Projects collection updated');
+        console.log('[CREATE PROJECT] Success!');
+        
+        res.json({
+            success: true,
+            message: "Project created successfully",
+            project: {
+                projectName: projectName.trim(),
+                projectDuration,
+                description: description?.trim() || '',
+                groupMembers: sanitizedMembers,
+            }
+        });
+    } catch (err) {
+        console.error("Create project error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PUT /api/mentee/group-members — mentee sets/updates group members (locked after assignment)
+app.put("/api/mentee/group-members", requireRole('mentee'), async (req, res) => {
+    const { groupMembers } = req.body;
+    if (!Array.isArray(groupMembers)) {
+        return res.status(400).json({ success: false, message: "groupMembers must be an array" });
+    }
+    if (groupMembers.length > 5) {
+        return res.status(400).json({ success: false, message: "Maximum 5 group members allowed" });
+    }
+    // Validate each member
+    for (const m of groupMembers) {
+        if (!m.name?.trim()) return res.status(400).json({ success: false, message: "Each member must have a name" });
+    }
+    // Check for duplicate emails (ignore empty emails)
+    const emails = groupMembers.map(m => m.email?.toLowerCase()).filter(Boolean);
+    if (new Set(emails).size !== emails.length) {
+        return res.status(400).json({ success: false, message: "Duplicate member emails are not allowed" });
+    }
+    try {
+        const user = await usersCollection.findOne({ email: req.userEmail });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+        // Block if project has been finalised
+        const assignment = await db.collection('assignments').findOne({ menteeEmail: req.userEmail });
+        if (assignment?.finalRemark) {
+            return res.status(403).json({ success: false, message: "Your project has been finalised. Group members cannot be modified." });
+        }
+        const sanitized = groupMembers.map(m => ({
+            name: m.name.trim(),
+            email: m.email?.trim().toLowerCase() || '',
+            rollNo: m.rollNo?.trim() || '',
+            contactNo: m.contactNo?.toString().trim() || '',
+        }));
+        await usersCollection.updateOne({ email: req.userEmail }, { $set: { groupMembers: sanitized } });
+        res.json({ success: true, message: "Group members updated", groupMembers: sanitized });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/mentee/group-members — get group members for a mentee (mentor/coordinator/hod can also access)
+app.get("/api/mentee/group-members", requireRole('mentee', 'mentor', 'project_coordinator', 'hod'), async (req, res) => {
+    const targetEmail = (req.query.email || req.userEmail).toLowerCase();
+    try {
+        const user = await usersCollection.findOne({ email: targetEmail });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+        res.json({ success: true, groupMembers: user.groupMembers || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PATCH /api/mentee/profile — mentee updates name, contactNo, rollNo
+app.patch("/api/mentee/profile", requireRole('mentee'), async (req, res) => {
+    const { name, contactNo, rollNo } = req.body;
+    if (!name?.trim()) return res.status(400).json({ success: false, message: "Name is required" });
+    try {
+        await usersCollection.updateOne(
+            { email: req.userEmail },
+            { $set: { name: name.trim(), contactNo: contactNo?.toString().trim() || '', rollNo: rollNo?.trim() || '' } }
+        );
+        res.json({ success: true, message: "Profile updated" });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PATCH /api/mentee/project-name — mentee updates their own project name (only if not assigned)
+app.patch("/api/mentee/project-name", requireRole('mentee'), async (req, res) => {
+    const { projectName } = req.body;
+    if (!projectName?.trim()) return res.status(400).json({ success: false, message: "projectName is required" });
+    try {
+        const user = await usersCollection.findOne({ email: req.userEmail });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+        if (user.projectStatus === 'assigned') {
+            return res.status(403).json({ success: false, message: "Project name is locked after mentor assignment" });
+        }
+        await usersCollection.updateOne({ email: req.userEmail }, { $set: { projectName: projectName.trim(), projectStatus: 'pending' } });
+        res.json({ success: true, message: "Project name updated" });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/mentee/status — get mentee's project status and assignment info
+app.get("/api/mentee/status", requireRole('mentee'), async (req, res) => {
+    try {
+        const user = await usersCollection.findOne({ email: req.userEmail });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+        const assignment = await db.collection("assignments").findOne({ menteeEmail: req.userEmail });
+        // ADDED: fetch project duration — check project doc first, fall back to assignment doc
+        const project = await projectsCollection.findOne({ menteeEmail: req.userEmail });
+        const resolvedDuration = project?.duration || assignment?.duration || '6_months';
+        // Check for unread notifications
+        const notifications = await db.collection("notifications")
+            .find({ recipientEmail: req.userEmail, read: false })
+            .sort({ createdAt: -1 }).toArray();
+        res.json({
+            success: true,
+            data: {
+                name: user.name || '',
+                rollNo: user.rollNo || '',
+                contactNo: user.contactNo || '',
+                projectName: user.projectName || '',
+                projectDuration: user.projectDuration || project?.duration || '6_months',
+                projectDescription: user.projectDescription || project?.description || '',
+                projectStatus: user.projectStatus || 'pending',
+                groupMembers: user.groupMembers || [],
+                assignment: assignment || null,
+                deadline: assignment?.deadline || null,
+                extendedDeadline: assignment?.extendedDeadline || null,
+                duration: resolvedDuration, // ADDED
+                notifications,
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// POST /api/notifications/read — mark notifications as read
+app.post("/api/notifications/read", requireRole('mentee', 'mentor'), async (req, res) => {
+    try {
+        await db.collection("notifications").updateMany(
+            { recipientEmail: req.userEmail, read: false },
+            { $set: { read: true } }
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// Login
+app.post("/api/login", async (req, res) => {
+    const { email, password, role } = req.body;
+    const normalizedEmail = email.toLowerCase();
+
+    try {
+        const user = await usersCollection.findOne({ email: normalizedEmail });
+        if (!user) return res.status(400).json({ success: false, message: "User not found" });
+
+        // Support both bcrypt hashed and legacy plaintext passwords
+        let passwordValid = false;
+        if (user.password.startsWith('$2')) {
+            passwordValid = await bcrypt.compare(password, user.password);
+        } else {
+            passwordValid = user.password === password;
+        }
+        if (!passwordValid) return res.status(400).json({ success: false, message: "Invalid password" });
+
+        // Build effective roles array (support both old `role` string and new `roles` array)
+        const effectiveRoles = user.roles?.length ? user.roles : [user.role];
+
+        // If a specific role was requested, validate it
+        if (role && !effectiveRoles.includes(role)) {
+            return res.status(403).json({ success: false, message: `You are not registered as ${role}` });
+        }
+
+        const resolvedRole = role || effectiveRoles[0];
+        const token = generateToken({ email: user.email, roles: effectiveRoles, name: user.name || '' }, resolvedRole);
+
+        res.json({ success: true, token, role: resolvedRole, roles: effectiveRoles, name: user.name || '', email: user.email, userId: user._id });
+    } catch (err) {
+        console.error("Login error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+/*************** PASSWORD RESET ROUTES ***************/
+
+const { generateOTP, hashOTP, verifyOTP } = require('./utils/otpService');
+const { passwordResetOTPEmail } = require('./utils/emailService');
+const { COLLECTION: RESET_COL, OTP_EXPIRY_MINUTES, MAX_ATTEMPTS } = require('./models/passwordReset');
+
+/**
+ * POST /api/password/forgot
+ * Request password reset OTP
+ * Body: { email }
+ */
+app.post("/api/password/forgot", async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: "Email is required" });
+
+    const normalizedEmail = email.toLowerCase();
+
+    try {
+        // Check if user exists
+        const user = await usersCollection.findOne({ email: normalizedEmail });
+        if (!user) {
+            // Security: Don't reveal if email exists or not
+            return res.json({ success: true, message: "If this email is registered, you will receive an OTP shortly." });
+        }
+
+        const resetCol = db.collection(RESET_COL);
+
+        // Rate limiting: Check if there's a recent unexpired OTP
+        const existingReset = await resetCol.findOne({
+            email: normalizedEmail,
+            expiresAt: { $gt: new Date() },
+            verified: false,
+        });
+
+        if (existingReset) {
+            const timeLeft = Math.ceil((existingReset.expiresAt - new Date()) / 1000 / 60);
+            return res.status(429).json({
+                success: false,
+                message: `An OTP was already sent. Please wait ${timeLeft} minute(s) before requesting a new one.`,
+            });
+        }
+
+        // Generate OTP
+        const otp = generateOTP();
+        const hashedOTP = hashOTP(otp);
+        const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
+
+        // Save to DB
+        await resetCol.insertOne({
+            email: normalizedEmail,
+            otp: hashedOTP,
+            createdAt: new Date(),
+            expiresAt,
+            attempts: 0,
+            verified: false,
+        });
+
+        // Send email (fire-and-forget)
+        setImmediate(async () => {
+            try {
+                const tpl = passwordResetOTPEmail({ userName: user.name || normalizedEmail, otp });
+                await sendEmail({ to: normalizedEmail, ...tpl });
+            } catch (e) {
+                console.error('[Email] Password reset OTP send failed:', e.message);
+            }
+        });
+
+        res.json({ success: true, message: "OTP sent to your email. Valid for 5 minutes." });
+    } catch (err) {
+        console.error("Forgot password error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+/**
+ * POST /api/password/verify-otp
+ * Verify OTP before allowing password reset
+ * Body: { email, otp }
+ */
+app.post("/api/password/verify-otp", async (req, res) => {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ success: false, message: "Email and OTP are required" });
+
+    const normalizedEmail = email.toLowerCase();
+
+    try {
+        const resetCol = db.collection(RESET_COL);
+
+        // Find the most recent unexpired OTP
+        const resetDoc = await resetCol.findOne({
+            email: normalizedEmail,
+            expiresAt: { $gt: new Date() },
+            verified: false,
+        });
+
+        if (!resetDoc) {
+            return res.status(400).json({ success: false, message: "Invalid or expired OTP" });
+        }
+
+        // Check max attempts
+        if (resetDoc.attempts >= MAX_ATTEMPTS) {
+            await resetCol.deleteOne({ _id: resetDoc._id });
+            return res.status(403).json({ success: false, message: "Too many failed attempts. Please request a new OTP." });
+        }
+
+        // Verify OTP
+        if (!verifyOTP(otp, resetDoc.otp)) {
+            await resetCol.updateOne({ _id: resetDoc._id }, { $inc: { attempts: 1 } });
+            const attemptsLeft = MAX_ATTEMPTS - (resetDoc.attempts + 1);
+            return res.status(400).json({
+                success: false,
+                message: `Invalid OTP. ${attemptsLeft} attempt(s) remaining.`,
+            });
+        }
+
+        // Mark as verified
+        await resetCol.updateOne({ _id: resetDoc._id }, { $set: { verified: true } });
+
+        res.json({ success: true, message: "OTP verified successfully. You can now reset your password." });
+    } catch (err) {
+        console.error("Verify OTP error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+/**
+ * POST /api/password/reset
+ * Reset password after OTP verification
+ * Body: { email, otp, newPassword }
+ */
+app.post("/api/password/reset", async (req, res) => {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) {
+        return res.status(400).json({ success: false, message: "Email, OTP, and new password are required" });
+    }
+
+    if (newPassword.length < 6) {
+        return res.status(400).json({ success: false, message: "Password must be at least 6 characters" });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+
+    try {
+        const resetCol = db.collection(RESET_COL);
+
+        // Find verified OTP
+        const resetDoc = await resetCol.findOne({
+            email: normalizedEmail,
+            expiresAt: { $gt: new Date() },
+            verified: true,
+        });
+
+        if (!resetDoc) {
+            return res.status(400).json({ success: false, message: "Invalid or expired OTP. Please verify OTP first." });
+        }
+
+        // Double-check OTP matches
+        if (!verifyOTP(otp, resetDoc.otp)) {
+            return res.status(400).json({ success: false, message: "Invalid OTP" });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        // Update user password
+        const result = await usersCollection.updateOne(
+            { email: normalizedEmail },
+            { $set: { password: hashedPassword } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+
+        // Delete used OTP
+        await resetCol.deleteOne({ _id: resetDoc._id });
+
+        res.json({ success: true, message: "Password reset successfully. You can now log in with your new password." });
+    } catch (err) {
+        console.error("Reset password error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/role-availability — check if singleton roles still have open slots
+app.get("/api/role-availability", async (req, res) => {
+    try {
+        const pcCount = await usersCollection.countDocuments({ $or: [{ roles: 'project_coordinator' }, { role: 'project_coordinator', roles: { $exists: false } }] });
+        const hodCount = await usersCollection.countDocuments({ $or: [{ roles: 'hod' }, { role: 'hod', roles: { $exists: false } }] });
+        res.json({
+            success: true,
+            data: {
+                project_coordinator: { available: pcCount === 0, filled: pcCount > 0 },
+                hod: { available: hodCount === 0, filled: hodCount > 0 },
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// Get mentors — accessible by coordinator and hod only
+app.get("/api/mentors", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const mentors = await usersCollection.find({ $or: [{ role: "mentor" }, { roles: "mentor" }] }).toArray();
+        res.json({ success: true, data: mentors });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch mentors" });
+    }
+});
+
+// Get mentees — accessible by coordinator and hod only
+app.get("/api/mentees", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const mentees = await usersCollection.find({ $or: [{ role: "mentee" }, { roles: "mentee" }] })
+            .project({ email: 1, name: 1, rollNo: 1, contactNo: 1, projectName: 1, projectStatus: 1, groupMembers: 1 }).toArray();
+        res.json({ success: true, data: mentees });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch mentees" });
+    }
+});
+
+// PATCH /api/coordinator/project-status — approve or reject a mentee's project
+app.patch("/api/coordinator/project-status", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { menteeEmail, status } = req.body; // status: 'approved' | 'rejected'
+    if (!menteeEmail || !['approved', 'rejected'].includes(status)) {
+        return res.status(400).json({ success: false, message: "menteeEmail and valid status required" });
+    }
+    try {
+        const mentee = await usersCollection.findOne({ email: menteeEmail.toLowerCase(), $or: [{ role: 'mentee' }, { roles: 'mentee' }] });
+        if (!mentee) return res.status(404).json({ success: false, message: "Mentee not found" });
+
+        await usersCollection.updateOne(
+            { email: menteeEmail.toLowerCase() },
+            { $set: { projectStatus: status } }
+        );
+
+        // Notify mentee
+        await db.collection("notifications").insertOne({
+            recipientEmail: menteeEmail.toLowerCase(),
+            recipientRole: 'mentee',
+            message: status === 'approved'
+                ? `Your project "${mentee.projectName}" has been approved by the coordinator.`
+                : `Your project "${mentee.projectName}" has been rejected. Please update your project name.`,
+            read: false,
+            createdAt: new Date(),
+        });
+
+        res.json({ success: true, message: `Project ${status}` });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+/*************** PROJECT ROUTES ***************/
+
+// Add project and assign mentor + mentee — coordinator only
+app.post("/api/add-project", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    // ADDED: duration field
+    const { projectName, mentorEmail, menteeEmail, duration } = req.body;
+
+    if (!projectName || !mentorEmail || !menteeEmail) {
+        return res.status(400).json({ success: false, message: "All fields are required" });
+    }
+
+    // ADDED: validate duration
+    const validDurations = ['6_months', '1_year'];
+    const resolvedDuration = validDurations.includes(duration) ? duration : '6_months';
+
+    try {
+        const mentor = await usersCollection.findOne({ email: mentorEmail, $or: [{ role: "mentor" }, { roles: "mentor" }] });
+        const mentee = await usersCollection.findOne({ email: menteeEmail, $or: [{ role: "mentee" }, { roles: "mentee" }] });
+
+        if (!mentor || !mentee) {
+            return res.status(400).json({ success: false, message: "Invalid mentor or mentee email" });
+        }
+
+        const result = await projectsCollection.insertOne({
+            projectName,
+            mentorEmail,
+            menteeEmail,
+            duration: resolvedDuration, // ADDED
+            createdAt: new Date(),
+        });
+
+        res.json({ success: true, message: "Project added successfully", projectId: result.insertedId });
+    } catch (error) {
+        console.error("Error adding project:", error);
+        res.status(500).json({ success: false, message: "Server error while adding project" });
+    }
+});
+
+// Get all projects — coordinator and hod
+app.get("/api/projects", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const projects = await projectsCollection.find({}).toArray();
+        res.json({ success: true, data: projects });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch projects" });
+    }
+});
+
+// Get mentor's projects — mentor only
+app.get("/api/mentor-projects", verifyToken, checkRole('mentor'), async (req, res) => {
+    const { mentorEmail } = req.query;
+    if (!mentorEmail) {
+        return res.status(400).json({ success: false, message: "Mentor email is required" });
+    }
+
+    try {
+        const projects = await projectsCollection.find({ mentorEmail }).toArray();
+        res.json({ success: true, data: projects });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch mentor's projects" });
+    }
+});
+
+// HOD view: All assignments enriched with mentor + mentee info
+app.get("/api/hod/project-details", verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
+    try {
+        const assignments = await db.collection("assignments").find({}).toArray();
+        const detailed = await Promise.all(
+            assignments.map(async (a) => {
+                const mentor  = await usersCollection.findOne({ email: a.mentorEmail });
+                const mentee  = await usersCollection.findOne({ email: a.menteeEmail });
+                const project = await projectsCollection.findOne({ menteeEmail: a.menteeEmail });
+                // duration: project doc is most up-to-date, fall back to assignment doc
+                const duration = project?.duration || a.duration || '6_months';
+                return {
+                    _id: a._id,
+                    projectName: a.projectName,
+                    duration,
+                    mentor: mentor ? { email: mentor.email, name: mentor.name || '' } : { email: a.mentorEmail, name: '' },
+                    mentee: mentee ? { email: mentee.email, name: mentee.name || '', rollNo: mentee.rollNo || '', contactNo: mentee.contactNo || '' } : { email: a.menteeEmail, name: '', rollNo: '', contactNo: '' },
+                    groupMembers: mentee?.groupMembers || [],
+                    assignedBy: a.assignedBy,
+                    createdAt: a.createdAt,
+                    updatedAt: a.updatedAt,
+                    finalRemark: a.finalRemark || null,
+                    finalRemarkedAt: a.finalRemarkedAt || null,
+                };
+            })
+        );
+        res.json({ success: true, data: detailed });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch HOD project details" });
+    }
+});
+
+// HOD: Generate pre-signed S3 URL for secure file access
+app.post("/api/hod/presigned-url", verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
+    const { fileUrl } = req.body;
+    if (!fileUrl) return res.status(400).json({ success: false, message: "fileUrl is required" });
+
+    try {
+        const key = extractS3Key(fileUrl);
+        const params = { Bucket: process.env.S3_BUCKET_NAME, Key: key, Expires: 300 };
+        const signedUrl = s3.getSignedUrl("getObject", params);
+        res.json({ success: true, url: signedUrl });
+    } catch (err) {
+        console.error("Pre-signed URL error:", err);
+        res.status(500).json({ success: false, message: "Failed to generate pre-signed URL" });
+    }
+});
+
+// HOD: Stats summary
+app.get("/api/hod/stats", verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
+    try {
+        const [mentorCount, menteeCount, assignmentCount] = await Promise.all([
+            usersCollection.countDocuments({ $or: [{ role: "mentor" }, { roles: "mentor" }] }),
+            usersCollection.countDocuments({ $or: [{ role: "mentee" }, { roles: "mentee" }] }),
+            db.collection("assignments").countDocuments(),
+        ]);
+        res.json({ success: true, data: { mentors: mentorCount, mentees: menteeCount, assignments: assignmentCount } });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    }
+});
+
+/*************** ASSIGNMENT ROUTES ***************/
+
+// POST /api/assignments — assign mentor to mentee+project — coordinator only
+app.post("/api/assignments", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { menteeEmail, mentorEmail, assignedBy } = req.body;
+    let { projectName } = req.body;
+    // ADDED: accept duration, default to 6_months for backward compat
+    const validDurations = ['6_months', '1_year'];
+    const duration = validDurations.includes(req.body.duration) ? req.body.duration : '6_months';
+
+    if (!menteeEmail || !mentorEmail || !assignedBy) {
+        return res.status(400).json({ success: false, message: "menteeEmail, mentorEmail and assignedBy are required" });
+    }
+
+    try {
+        const mentor = await usersCollection.findOne({ email: mentorEmail.toLowerCase(), $or: [{ role: "mentor" }, { roles: "mentor" }] });
+        const mentee = await usersCollection.findOne({ email: menteeEmail.toLowerCase(), $or: [{ role: "mentee" }, { roles: "mentee" }] });
+
+        if (!mentor) return res.status(400).json({ success: false, message: "Mentor not found or invalid role" });
+        if (!mentee) return res.status(400).json({ success: false, message: "Mentee not found or invalid role" });
+
+        // Auto-fetch project name from mentee record if not provided
+        if (!projectName) projectName = mentee.projectName || '';
+        if (!projectName) return res.status(400).json({ success: false, message: "Mentee has no project name set" });
+
+        // Prevent duplicate: one mentee can only have one assignment
+        const existing = await db.collection("assignments").findOne({ menteeEmail: menteeEmail.toLowerCase() });
+        if (existing) {
+            return res.status(409).json({ success: false, message: "This mentee already has an assignment. Use update instead." });
+        }
+
+        const result = await db.collection("assignments").insertOne({
+            projectName,
+            menteeEmail: menteeEmail.toLowerCase(),
+            mentorEmail: mentorEmail.toLowerCase(),
+            assignedBy: assignedBy.toLowerCase(),
+            duration, // ADDED
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        });
+
+        // Lock project name on mentee record
+        await usersCollection.updateOne(
+            { email: menteeEmail.toLowerCase() },
+            { $set: { projectStatus: 'assigned', projectName } }
+        );
+
+        // ADDED: upsert project doc with duration so phase validation works
+        await projectsCollection.updateOne(
+            { menteeEmail: menteeEmail.toLowerCase() },
+            { $set: { projectName, mentorEmail: mentorEmail.toLowerCase(), duration, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+            { upsert: true }
+        );
+
+        // Notify mentee
+        await db.collection("notifications").insertOne({
+            recipientEmail: menteeEmail.toLowerCase(),
+            recipientRole: 'mentee',
+            message: `You have been assigned a mentor: ${mentorEmail}. Your project "${projectName}" is now active.`,
+            read: false,
+            createdAt: new Date(),
+        });
+
+        // Notify mentor
+        await db.collection("notifications").insertOne({
+            recipientEmail: mentorEmail.toLowerCase(),
+            recipientRole: 'mentor',
+            message: `Project "${projectName}" by ${menteeEmail} has been assigned to you.`,
+            read: false,
+            createdAt: new Date(),
+        });
+
+        res.status(201).json({ success: true, message: "Assignment created successfully", assignmentId: result.insertedId });
+
+        // Fire-and-forget emails
+        setImmediate(async () => {
+          try {
+            const tplMentee = assignmentCreatedMenteeEmail({ menteeName: mentee.name || menteeEmail, projectName, mentorEmail });
+            await sendEmail({ to: menteeEmail.toLowerCase(), ...tplMentee });
+            const tplMentor = assignmentCreatedMentorEmail({ mentorName: mentor.name || mentorEmail, projectName, menteeName: mentee.name || menteeEmail, menteeEmail: menteeEmail.toLowerCase() });
+            await sendEmail({ to: mentorEmail.toLowerCase(), ...tplMentor });
+          } catch (e) { console.error('[Email] assignment trigger:', e.message); }
+        });
+    } catch (err) {
+        console.error("Assignment error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// POST /api/assignments/bulk-csv — bulk assign mentors via CSV — coordinator only
+// CSV format (header row required): menteeEmail,mentorEmail,duration
+app.post("/api/assignments/bulk-csv", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { rows } = req.body; // [{ menteeEmail, mentorEmail, duration? }]
+    if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(400).json({ success: false, message: "No rows provided" });
+    }
+
+    const assignedBy = req.userEmail;
+    const validDurations = ['6_months', '1_year'];
+    const results = [];
+
+    for (const row of rows) {
+        const menteeEmail = row.menteeEmail?.trim().toLowerCase();
+        const mentorEmail = row.mentorEmail?.trim().toLowerCase();
+        const duration    = validDurations.includes(row.duration?.trim()) ? row.duration.trim() : '6_months';
+
+        if (!menteeEmail || !mentorEmail) {
+            results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Missing email' });
+            continue;
+        }
+
+        try {
+            const mentor = await usersCollection.findOne({ email: mentorEmail, $or: [{ role: 'mentor' }, { roles: 'mentor' }] });
+            const mentee = await usersCollection.findOne({ email: menteeEmail, $or: [{ role: 'mentee' }, { roles: 'mentee' }] });
+
+            if (!mentor) { results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Mentor not found' }); continue; }
+            if (!mentee) { results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Mentee not found' }); continue; }
+
+            const projectName = mentee.projectName || '';
+            if (!projectName) { results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Mentee has no project name set — ask them to set it first' }); continue; }
+
+            const existing = await db.collection('assignments').findOne({ menteeEmail });
+            if (existing) { results.push({ menteeEmail, mentorEmail, duration, status: 'skipped', reason: 'Already assigned' }); continue; }
+
+            if (mentee.projectStatus === 'rejected') {
+                results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Project was manually rejected — approve it first before assigning' }); continue;
+            }
+
+            if (mentee.projectStatus !== 'assigned') {
+                await usersCollection.updateOne({ email: menteeEmail }, { $set: { projectStatus: 'approved' } });
+            }
+
+            await db.collection('assignments').insertOne({
+                projectName,
+                menteeEmail,
+                mentorEmail,
+                assignedBy,
+                duration, // ADDED
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            });
+
+            // Upsert project doc so phase validation works
+            await projectsCollection.updateOne(
+                { menteeEmail },
+                { $set: { projectName, mentorEmail, duration, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+                { upsert: true }
+            );
+
+            await usersCollection.updateOne({ email: menteeEmail }, { $set: { projectStatus: 'assigned', projectName } });
+
+            await db.collection('notifications').insertOne({
+                recipientEmail: menteeEmail, recipientRole: 'mentee',
+                message: `You have been assigned a mentor: ${mentorEmail}. Your project "${projectName}" is now active.`,
+                read: false, createdAt: new Date(),
+            });
+            await db.collection('notifications').insertOne({
+                recipientEmail: mentorEmail, recipientRole: 'mentor',
+                message: `Project "${projectName}" by ${menteeEmail} has been assigned to you.`,
+                read: false, createdAt: new Date(),
+            });
+
+            results.push({ menteeEmail, mentorEmail, projectName, duration, status: 'success' });
+        } catch (err) {
+            results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: err.message });
+        }
+    }
+
+    const succeeded = results.filter(r => r.status === 'success').length;
+    const failed    = results.filter(r => r.status === 'error').length;
+    const skipped   = results.filter(r => r.status === 'skipped').length;
+
+    res.json({ success: true, message: `${succeeded} assigned, ${skipped} skipped, ${failed} failed`, results });
+});
+
+// GET /api/assignments — get all assignments — coordinator and hod
+app.get("/api/assignments", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const assignments = await db.collection("assignments").find({}).toArray();
+        res.json({ success: true, data: assignments });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Failed to fetch assignments" });
+    }
+});
+
+// GET /api/assignments/mentee/:email — get assignment for a specific mentee
+app.get("/api/assignments/mentee/:email", verifyToken, checkRole('mentee', 'project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const assignment = await db.collection("assignments").findOne({ menteeEmail: req.params.email.toLowerCase() });
+        if (!assignment) return res.status(404).json({ success: false, message: "No assignment found" });
+        res.json({ success: true, data: assignment }); // includes finalRemark if set
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/assignments/mentor/:email — get all mentees assigned to a mentor
+app.get("/api/assignments/mentor/:email", verifyToken, checkRole('mentor', 'project_coordinator', 'hod'), async (req, res) => {
+    try {
+        const assignments = await db.collection("assignments").find({ mentorEmail: req.params.email.toLowerCase() }).toArray();
+        // Enrich each assignment with groupMembers + duration
+        const enriched = await Promise.all(assignments.map(async (a) => {
+            const mentee = await usersCollection.findOne({ email: a.menteeEmail });
+            const project = await projectsCollection.findOne({ menteeEmail: a.menteeEmail });
+            // duration: prefer project doc (most up-to-date), fall back to assignment doc
+            const duration = project?.duration || a.duration || '6_months';
+            return { ...a, duration, groupMembers: mentee?.groupMembers || [], menteeName: mentee?.name || '' };
+        }));
+        res.json({ success: true, data: enriched });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PATCH /api/assignments/:id/final-remark — mentor marks project as Done/Accepted
+// Only callable by the assigned mentor, only when all uploaded files have been remarked
+app.patch("/api/assignments/:id/final-remark", requireRole('mentor'), async (req, res) => {
+  const { finalRemark } = req.body;
+  if (!finalRemark?.trim()) {
+    return res.status(400).json({ success: false, message: 'finalRemark is required' });
+  }
+  try {
+    const assignment = await db.collection("assignments").findOne({ _id: new ObjectId(req.params.id) });
+    if (!assignment) return res.status(404).json({ success: false, message: 'Assignment not found' });
+    if (assignment.mentorEmail !== req.userEmail) {
+      return res.status(403).json({ success: false, message: 'You are not the assigned mentor' });
+    }
+
+    // Verify all uploaded files have a non-pending remark
+    const files = await db.collection(FILE_COL).find({ uploaded_by: assignment.menteeEmail }).toArray();
+    const allRemarked = files.length > 0 && files.every(f => f.remark && f.remark !== 'Pending Review');
+    if (!allRemarked) {
+      return res.status(400).json({ success: false, message: 'All uploaded files must be reviewed before marking as done' });
+    }
+
+    await db.collection("assignments").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { finalRemark: finalRemark.trim(), finalRemarkedAt: new Date(), updatedAt: new Date() } }
+    );
+    res.json({ success: true, message: 'Final remark saved' });
+
+    // Fire-and-forget: notify mentee
+    setImmediate(async () => {
+      try {
+        const mentee = await usersCollection.findOne({ email: assignment.menteeEmail });
+        await db.collection('notifications').insertOne({
+          recipientEmail: assignment.menteeEmail,
+          recipientRole: 'mentee',
+          message: `Your project "${assignment.projectName}" has received a final evaluation: ${finalRemark.trim()}`,
+          read: false,
+          createdAt: new Date(),
+        });
+        if (mentee?.email) {
+          const tpl = finalRemarkEmail({
+            menteeName:  mentee.name || assignment.menteeEmail,
+            projectName: assignment.projectName || 'Your Project',
+            finalRemark: finalRemark.trim(),
+          });
+          await sendEmail({ to: mentee.email, ...tpl });
+        }
+      } catch (e) { console.error('[Email] final-remark trigger:', e.message); }
+    });
+  } catch (err) {
+    console.error('Final remark error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// PATCH /api/assignments/:id/deadline — coordinator sets submission deadline
+app.patch("/api/assignments/:id/deadline", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { deadline } = req.body;
+    if (!deadline) return res.status(400).json({ success: false, message: "deadline is required" });
+    const parsed = new Date(deadline);
+    if (isNaN(parsed)) return res.status(400).json({ success: false, message: "Invalid date format" });
+    try {
+        const result = await db.collection("assignments").updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { deadline: parsed, updatedAt: new Date() } }
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ success: false, message: "Assignment not found" });
+        res.json({ success: true, message: "Deadline set successfully" });
+    } catch (err) {
+        console.error("Deadline error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PUT /api/assignments/:id/set-deadline — mentor sets the original deadline (one-time only)
+app.put("/api/assignments/:id/set-deadline", requireRole('mentor'), async (req, res) => {
+    const { deadline } = req.body;
+    if (!deadline) return res.status(400).json({ success: false, message: "deadline is required" });
+    const parsed = new Date(deadline);
+    if (isNaN(parsed)) return res.status(400).json({ success: false, message: "Invalid date format" });
+    try {
+        const assignment = await db.collection("assignments").findOne({ _id: new ObjectId(req.params.id) });
+        if (!assignment) return res.status(404).json({ success: false, message: "Assignment not found" });
+        if (assignment.mentorEmail !== req.userEmail) {
+            return res.status(403).json({ success: false, message: "Only the assigned mentor can set the deadline" });
+        }
+        // One-time only — block if already set
+        if (assignment.deadline) {
+            return res.status(400).json({ success: false, message: "Deadline already set. Use extend-deadline to give more time." });
+        }
+        await db.collection("assignments").updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { deadline: parsed, updatedAt: new Date() } }
+        );
+        await db.collection("notifications").insertOne({
+            recipientEmail: assignment.menteeEmail,
+            recipientRole: 'mentee',
+            message: `Your mentor has set a submission deadline: ${parsed.toLocaleString()}.`,
+            read: false,
+            createdAt: new Date(),
+        });
+        res.json({ success: true, message: "Deadline set successfully" });
+
+        // Fire-and-forget email
+        setImmediate(async () => {
+          try {
+            const mentee = await usersCollection.findOne({ email: assignment.menteeEmail });
+            if (mentee?.email) {
+              const tpl = deadlineSetEmail({
+                menteeName:  mentee.name || assignment.menteeEmail,
+                projectName: assignment.projectName || 'Your Project',
+                deadline:    parsed,
+              });
+              await sendEmail({ to: mentee.email, ...tpl });
+            }
+          } catch (e) { console.error('[Email] set-deadline trigger:', e.message); }
+        });
+    } catch (err) {
+        console.error("Set deadline error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PUT /api/assignments/:id/extend-deadline — mentor extends the deadline (one-time only)
+app.put("/api/assignments/:id/extend-deadline", requireRole('mentor'), async (req, res) => {
+    const { extendedDeadline } = req.body;
+    if (!extendedDeadline) return res.status(400).json({ success: false, message: "extendedDeadline is required" });
+    const parsed = new Date(extendedDeadline);
+    if (isNaN(parsed)) return res.status(400).json({ success: false, message: "Invalid date format" });
+    try {
+        const assignment = await db.collection("assignments").findOne({ _id: new ObjectId(req.params.id) });
+        if (!assignment) return res.status(404).json({ success: false, message: "Assignment not found" });
+        if (assignment.mentorEmail !== req.userEmail) {
+            return res.status(403).json({ success: false, message: "Only the assigned mentor can extend the deadline" });
+        }
+        if (!assignment.deadline) {
+            return res.status(400).json({ success: false, message: "Set an original deadline before extending" });
+        }
+        // One-time only — block if already extended
+        if (assignment.extendedDeadline) {
+            return res.status(400).json({ success: false, message: "Deadline has already been extended once. No further changes allowed." });
+        }
+        if (parsed <= new Date(assignment.deadline)) {
+            return res.status(400).json({ success: false, message: "Extended deadline must be after the original deadline" });
+        }
+        await db.collection("assignments").updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { extendedDeadline: parsed, updatedAt: new Date() } }
+        );
+        await db.collection("notifications").insertOne({
+            recipientEmail: assignment.menteeEmail,
+            recipientRole: 'mentee',
+            message: `Your mentor has extended the deadline to: ${parsed.toLocaleString()}.`,
+            read: false,
+            createdAt: new Date(),
+        });
+        res.json({ success: true, message: "Deadline extended successfully" });
+
+        // Fire-and-forget email
+        setImmediate(async () => {
+          try {
+            const mentee = await usersCollection.findOne({ email: assignment.menteeEmail });
+            if (mentee?.email) {
+              const tpl = deadlineExtendedEmail({
+                menteeName:  mentee.name || assignment.menteeEmail,
+                projectName: assignment.projectName || 'Your Project',
+                oldDeadline: assignment.deadline,
+                newDeadline: parsed,
+              });
+              await sendEmail({ to: mentee.email, ...tpl });
+            }
+          } catch (e) { console.error('[Email] extend-deadline trigger:', e.message); }
+        });
+    } catch (err) {
+        console.error("Extend deadline error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// PUT /api/assignments/:id — update an assignment — coordinator only
+app.put("/api/assignments/:id", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    const { projectName, mentorEmail } = req.body;
+    // ADDED: optional duration update
+    const validDurations = ['6_months', '1_year'];
+    const duration = validDurations.includes(req.body.duration) ? req.body.duration : null;
+
+    if (!projectName && !mentorEmail && !duration) {
+        return res.status(400).json({ success: false, message: "Provide at least one field to update" });
+    }
+
+    try {
+        let updateFields = { updatedAt: new Date() };
+        if (projectName) updateFields.projectName = projectName;
+        if (duration) updateFields.duration = duration;
+        if (mentorEmail) {
+            const mentor = await usersCollection.findOne({ email: mentorEmail.toLowerCase(), $or: [{ role: "mentor" }, { roles: "mentor" }] });
+            if (!mentor) return res.status(400).json({ success: false, message: "Mentor not found or invalid role" });
+            updateFields.mentorEmail = mentorEmail.toLowerCase();
+        }
+
+        // Fetch BEFORE update so we have the old values
+        const oldAssignment = await db.collection("assignments").findOne({ _id: new ObjectId(req.params.id) });
+        if (!oldAssignment) return res.status(404).json({ success: false, message: "Assignment not found" });
+
+        const result = await db.collection("assignments").updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updateFields }
+        );
+
+        if (result.matchedCount === 0) return res.status(404).json({ success: false, message: "Assignment not found" });
+
+        // Update user's project details if project name or duration changed
+        if (projectName || duration) {
+            const userUpdateFields = {};
+            if (projectName) userUpdateFields.projectName = projectName;
+            if (duration) userUpdateFields.projectDuration = duration;
+            
+            await usersCollection.updateOne(
+                { email: oldAssignment.menteeEmail },
+                { $set: userUpdateFields }
+            );
+        }
+
+        // keep project doc in sync — upsert so it works even if no project doc exists yet
+        if (duration || projectName) {
+            const projectUpdateFields = { updatedAt: new Date() };
+            if (duration) projectUpdateFields.duration = duration;
+            if (projectName) projectUpdateFields.projectName = projectName;
+            
+            await projectsCollection.updateOne(
+                { menteeEmail: oldAssignment.menteeEmail },
+                {
+                    $set: projectUpdateFields,
+                    $setOnInsert: { menteeEmail: oldAssignment.menteeEmail, createdAt: new Date() },
+                },
+                { upsert: true }
+            );
+        }
+
+        res.json({ success: true, message: "Assignment updated successfully" });
+
+        // Fire-and-forget: notifications for all changes
+        setImmediate(async () => {
+            try {
+                const mentee = await usersCollection.findOne({ email: oldAssignment.menteeEmail });
+                const menteeName = mentee?.name || oldAssignment.menteeEmail;
+                const oldProjectName = oldAssignment.projectName || 'Project';
+                const newProjectName = projectName || oldProjectName;
+                
+                // Notify mentee about project name change
+                if (projectName && projectName !== oldAssignment.projectName) {
+                    await db.collection('notifications').insertOne({
+                        recipientEmail: oldAssignment.menteeEmail,
+                        recipientRole: 'mentee',
+                        message: `Your project name has been updated from "${oldProjectName}" to "${projectName}" by the coordinator.`,
+                        read: false,
+                        createdAt: new Date(),
+                    });
+                }
+                
+                // Notify mentee about duration change
+                if (duration && duration !== oldAssignment.duration) {
+                    const oldDurationLabel = oldAssignment.duration === '1_year' ? '1 Year' : '6 Months';
+                    const newDurationLabel = duration === '1_year' ? '1 Year' : '6 Months';
+                    await db.collection('notifications').insertOne({
+                        recipientEmail: oldAssignment.menteeEmail,
+                        recipientRole: 'mentee',
+                        message: `Your project duration has been updated from ${oldDurationLabel} to ${newDurationLabel} by the coordinator.`,
+                        read: false,
+                        createdAt: new Date(),
+                    });
+                }
+                
+                // Notify mentee about mentor change
+                if (mentorEmail && oldAssignment.mentorEmail !== mentorEmail.toLowerCase()) {
+                    const oldMentor = await usersCollection.findOne({ email: oldAssignment.mentorEmail });
+                    const newMentor = await usersCollection.findOne({ email: mentorEmail.toLowerCase() });
+                    
+                    // Email notifications
+                    await sendEmail({ to: oldAssignment.mentorEmail, ...mentorChangedOldMentorEmail({ oldMentorName: oldMentor?.name || oldAssignment.mentorEmail, projectName: newProjectName, menteeName, newMentorEmail: mentorEmail.toLowerCase() }) });
+                    await sendEmail({ to: mentorEmail.toLowerCase(), ...mentorChangedNewMentorEmail({ newMentorName: newMentor?.name || mentorEmail, projectName: newProjectName, menteeName, menteeEmail: oldAssignment.menteeEmail, oldMentorEmail: oldAssignment.mentorEmail }) });
+                    
+                    if (mentee?.email) {
+                        await sendEmail({ to: mentee.email, ...mentorChangedMenteeEmail({ menteeName, projectName: newProjectName, oldMentorEmail: oldAssignment.mentorEmail, newMentorEmail: mentorEmail.toLowerCase() }) });
+                    }
+                    
+                    // In-app notification for mentee
+                    await db.collection('notifications').insertOne({
+                        recipientEmail: oldAssignment.menteeEmail,
+                        recipientRole: 'mentee',
+                        message: `Your mentor has been changed from ${oldAssignment.mentorEmail} to ${mentorEmail.toLowerCase()} for project "${newProjectName}".`,
+                        read: false,
+                        createdAt: new Date(),
+                    });
+                }
+            } catch (e) { 
+                console.error('[Notification] assignment update trigger:', e.message); 
+            }
+        });
+    } catch (err) {
+        console.error("Update error:", err);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/mentor/notifications — get unread notifications for mentor
+app.get("/api/mentor/notifications", requireRole('mentor'), async (req, res) => {
+    try {
+        const notifications = await db.collection("notifications")
+            .find({ recipientEmail: req.userEmail, read: false })
+            .sort({ createdAt: -1 }).toArray();
+        res.json({ success: true, data: notifications });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// ── S3 Pre-signed URL Routes (v3 SDK) ────────────────────────────────────────
+app.post("/api/upload-url",   verifyToken, getUploadUrl);
+app.post("/api/download-url", verifyToken, getDownloadUrl);
+
+/*************** DASHBOARD ROUTES ***************/
+
+// GET /api/dashboard/mentee/:email
+app.get("/api/dashboard/mentee/:email", requireRole('mentee'), async (req, res) => {
+    const email = req.params.email.toLowerCase();
+    if (req.userEmail !== email) return res.status(403).json({ success: false, message: "Access denied" });
+    try {
+        const user = await usersCollection.findOne({ email });
+        const assignment = await db.collection("assignments").findOne({ menteeEmail: email });
+        const files = await db.collection(FILE_COL).find({ uploaded_by: email }).toArray();
+        const notifications = await db.collection("notifications")
+            .find({ recipientEmail: email })
+            .sort({ createdAt: -1 }).toArray();
+
+        // Dynamic total sections based on project duration
+        const projectDuration = user?.projectDuration || '6_months';
+        const allowedPhases = getAllowedPhases(projectDuration);
+        const totalSections = allowedPhases.length;
+        
+        const submitted = files.length;
+        const lateCount = files.filter(f => f.isLate).length;
+        const pendingReview = files.filter(f => f.remark === 'Pending Review').length;
+        const reviewed = files.filter(f => f.remark && f.remark !== 'Pending Review').length;
+
+        // Per-section submission info
+        const sectionStatus = files.map(f => ({
+            section: f.section,
+            filename: f.file_name,
+            submittedAt: f.submittedAt,
+            isLate: f.isLate,
+            submissionStatus: f.submissionStatus || (f.isLate ? 'Late Submission' : 'Submitted'),
+            remark: f.remark,
+        }));
+
+        res.json({
+            success: true,
+            data: {
+                name: user?.name || '',
+                projectName: user?.projectName || '',
+                projectStatus: user?.projectStatus || 'pending',
+                mentorEmail: assignment?.mentorEmail || null,
+                deadline: assignment?.deadline || null,
+                extendedDeadline: assignment?.extendedDeadline || null,
+                finalRemark: assignment?.finalRemark || null,
+                stats: { totalSections, submitted, lateCount, pendingReview, reviewed },
+                sectionStatus,
+                notifications,
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/dashboard/mentor/:email
+app.get("/api/dashboard/mentor/:email", requireRole('mentor'), async (req, res) => {
+    const email = req.params.email.toLowerCase();
+    if (req.userEmail !== email) return res.status(403).json({ success: false, message: "Access denied" });
+    try {
+        const assignments = await db.collection("assignments").find({ mentorEmail: email }).toArray();
+
+        const menteeData = await Promise.all(assignments.map(async (a) => {
+            const files = await db.collection(FILE_COL).find({ uploaded_by: a.menteeEmail }).toArray();
+            const menteeUser = await usersCollection.findOne({ email: a.menteeEmail });
+            const submitted = files.length;
+            const lateCount = files.filter(f => f.isLate).length;
+            const pendingReview = files.filter(f => f.remark === 'Pending Review').length;
+            return {
+                menteeEmail: a.menteeEmail,
+                menteeName: menteeUser?.name || '',
+                projectName: a.projectName,
+                assignmentId: a._id,
+                deadline: a.deadline || null,
+                extendedDeadline: a.extendedDeadline || null,
+                finalRemark: a.finalRemark || null,
+                stats: { submitted, lateCount, pendingReview },
+            };
+        }));
+
+        const totalAssigned = assignments.length;
+        const totalPendingReview = menteeData.reduce((s, m) => s + m.stats.pendingReview, 0);
+        const totalLate = menteeData.reduce((s, m) => s + m.stats.lateCount, 0);
+        const totalAccepted = assignments.filter(a => a.finalRemark).length;
+
+        res.json({
+            success: true,
+            data: {
+                stats: { totalAssigned, totalPendingReview, totalLate, totalAccepted },
+                mentees: menteeData,
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// GET /api/dashboard/coordinator
+app.get("/api/dashboard/coordinator", verifyToken, checkRole('project_coordinator'), async (req, res) => {
+    try {
+        const [totalStudents, totalMentors, assignments, allFiles] = await Promise.all([
+            usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }] }),
+            usersCollection.countDocuments({ $or: [{ role: 'mentor' }, { roles: 'mentor' }] }),
+            db.collection("assignments").find({}).toArray(),
+            db.collection(FILE_COL).find({}).toArray(),
+        ]);
+
+        const assignedStudents = assignments.length;
+        const pendingApproval = await usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }], projectStatus: 'pending' });
+        const approvedNotAssigned = await usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }], projectStatus: 'approved' });
+        const rejectedProjects = await usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }], projectStatus: 'rejected' });
+        const acceptedProjects = assignments.filter(a => a.finalRemark).length;
+
+        // Unique mentees who submitted at least one file
+        const submittedMentees = new Set(allFiles.map(f => f.uploaded_by)).size;
+        const lateSubmissions = allFiles.filter(f => f.isLate).length;
+        const onTimeSubmissions = allFiles.filter(f => !f.isLate && f.submittedAt).length;
+
+        // Per-assignment summary for table
+        const assignmentSummary = await Promise.all(assignments.map(async (a) => {
+            const files = await db.collection(FILE_COL).find({ uploaded_by: a.menteeEmail }).toArray();
+            const menteeUser = await usersCollection.findOne({ email: a.menteeEmail });
+            return {
+                menteeEmail: a.menteeEmail,
+                menteeName: menteeUser?.name || '',
+                mentorEmail: a.mentorEmail,
+                projectName: a.projectName,
+                submitted: files.length,
+                lateCount: files.filter(f => f.isLate).length,
+                pendingReview: files.filter(f => f.remark === 'Pending Review').length,
+                accepted: !!a.finalRemark,
+                deadline: a.deadline || null,
+            };
+        }));
+
+        res.json({
+            success: true,
+            data: {
+                stats: {
+                    totalStudents, totalMentors, assignedStudents,
+                    pendingApproval, approvedNotAssigned, rejectedProjects,
+                    submittedMentees, lateSubmissions, onTimeSubmissions, acceptedProjects,
+                },
+                assignments: assignmentSummary,
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+});
+
+// Start Server
+app.listen(PORT, () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}`);
+});
