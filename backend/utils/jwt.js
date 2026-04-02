@@ -9,11 +9,12 @@ const JWT_EXPIRES_IN = '7d';
  * @param {string} activeRole - the role the user logged in with
  */
 function generateToken(user, activeRole) {
+  const roles = (user.roles?.length ? user.roles : null) || (user.role ? [user.role] : []);
   return jwt.sign(
     {
       email:      user.email,
-      roles:      user.roles || [user.role],
-      activeRole: activeRole || (user.roles?.[0] ?? user.role),
+      roles,
+      activeRole: activeRole || roles[0] || '',
       name:       user.name || '',
     },
     JWT_SECRET,

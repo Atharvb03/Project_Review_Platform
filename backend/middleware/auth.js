@@ -21,10 +21,22 @@ function verifyToken(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // { email, roles, iat, exp }
-    // Backward-compat aliases used throughout server.js
+    req.user = decoded;
     req.userEmail = decoded.email;
     req.userRole  = decoded.activeRole || decoded.roles?.[0] || '';
+
+    // Block pending-role tokens from all routes except complete-profile
+    const isPending = decoded.activeRole === 'pending' || 
+                      (decoded.roles?.length === 0) ||
+                      (decoded.roles?.length === 1 && decoded.roles[0] === 'pending');
+    if (isPending && !req.path.includes('/auth/complete-profile')) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Profile setup required. Please complete your profile first.',
+        needsProfile: true
+      });
+    }
+
     next();
   } catch (err) {
     log('warn', 'Invalid or expired token', { path: req.path, ip: req.ip, error: err.message });

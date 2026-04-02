@@ -35,8 +35,8 @@ function StatusBadge({ text }) {
 
 export default function ProjectCoordinatorDashboard() {
   const { dark, toggle } = useTheme();
-  const [tab, setTab] = useState('mentees'); // Will be set dynamically based on batches
-  const [initialTabSet, setInitialTabSet] = useState(false); // Track if initial tab has been determined
+  const [tab, setTab] = useState(null); // null until fetchBatches determines the correct starting tab
+  const initialTabSetRef = React.useRef(false); // use ref to avoid stale closure issues
   const [mentors, setMentors] = useState([]);
   const [mentees, setMentees] = useState([]);
   const [assignments, setAssignments] = useState([]);
@@ -168,38 +168,37 @@ export default function ProjectCoordinatorDashboard() {
   }, []);
 
   const fetchAssignments = () => {
-    axios.get(`${API}/assignments`).then(r => {
+    return axios.get(`${API}/assignments`).then(r => {
       setAssignments(r.data.data || []);
     }).catch(() => {});
   };
 
   const fetchBatches = () => {
+    // Timeout fallback — if API takes >8s, default to batches tab
+    const fallback = setTimeout(() => {
+      if (!initialTabSetRef.current) {
+        initialTabSetRef.current = true;
+        setTab('batches');
+      }
+    }, 8000);
+
     axios.get(`${API}/batches`).then(r => {
+      clearTimeout(fallback);
       const batchList = r.data.data || [];
       setBatches(batchList);
-      
-      // Set active batch for display
+
       const active = batchList.find(b => b.isActive);
       if (active) setActiveBatch(active.name);
-      
-      // Set initial tab based on whether batches exist
-      if (!initialTabSet) {
-        if (batchList.length === 0) {
-          // No academic years created yet - start with batches tab
-          setTab('batches');
-          console.log('[PC Dashboard] No academic years found - showing Academic Year tab');
-        } else {
-          // Academic years exist - start with mentees tab
-          setTab('mentees');
-          console.log('[PC Dashboard] Academic years exist - showing Mentees & Projects tab');
-        }
-        setInitialTabSet(true);
+
+      if (!initialTabSetRef.current) {
+        initialTabSetRef.current = true;
+        setTab(batchList.length === 0 ? 'batches' : 'mentees');
       }
     }).catch(() => {
-      // On error, default to batches tab if not set
-      if (!initialTabSet) {
+      clearTimeout(fallback);
+      if (!initialTabSetRef.current) {
+        initialTabSetRef.current = true;
         setTab('batches');
-        setInitialTabSet(true);
       }
     });
   };
@@ -274,11 +273,18 @@ export default function ProjectCoordinatorDashboard() {
       await axios.post(`${API}/assignments`, { menteeEmail: form.menteeEmail, mentorEmail: form.mentorEmail, assignedBy: pcEmail, duration: form.duration });
       flash('Assignment created successfully!', 'success');
       setForm({ menteeEmail: '', mentorEmail: '', duration: '6_months' });
-      fetchAssignments();
-      // Refresh mentees to show updated status
-      axios.get(`${API}/mentees`).then(r => setMentees(r.data.data || [])).catch(() => {});
+      // Refresh data and switch back to mentees tab to show updated status
+      const [menteesRes] = await Promise.all([
+        axios.get(`${API}/mentees`).catch(() => null),
+        fetchAssignments(),
+      ]);
+      if (menteesRes) setMentees(menteesRes.data.data || []);
+      setTab('mentees');
     } catch (err) {
       flash(err.response?.data?.message || 'Failed to create assignment.', 'error');
+      // Always refresh mentees to keep status in sync (handles 409 case where assignment already exists)
+      const res2 = await axios.get(`${API}/mentees`).catch(() => null);
+      if (res2) setMentees(res2.data.data || []);
     } finally {
       setLoading(false);
     }
@@ -294,6 +300,18 @@ export default function ProjectCoordinatorDashboard() {
       flash(err.response?.data?.message || 'Action failed.', 'error');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDeleteUser = async (email) => {
+    if (!window.confirm(`Remove user "${email}" from the platform? This cannot be undone.`)) return;
+    try {
+      await axios.delete(`${API}/users/${encodeURIComponent(email)}`);
+      flash(`User ${email} removed.`, 'success');
+      axios.get(`${API}/mentees`).then(r => setMentees(r.data.data || [])).catch(() => {});
+      axios.get(`${API}/mentors`).then(r => setMentors(r.data.data || [])).catch(() => {});
+    } catch (err) {
+      flash(err.response?.data?.message || 'Failed to remove user.', 'error');
     }
   };
 
@@ -380,6 +398,19 @@ export default function ProjectCoordinatorDashboard() {
       <span>{icon}</span>{label}
     </button>
   );
+
+  // Wait until fetchBatches has determined the correct starting tab
+  if (!initialTabSetRef.current || tab === null) {
+    return (
+      <div className="flex min-h-screen items-center justify-center" style={{ backgroundColor: 'var(--bg-primary)' }}>
+        <div className="text-center">
+          <div className="w-10 h-10 rounded-full border-2 border-t-transparent animate-spin mx-auto mb-3"
+            style={{ borderColor: '#ec4899', borderTopColor: 'transparent' }} />
+          <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading dashboard...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen transition-colors duration-300" style={{ backgroundColor: 'var(--bg-primary)' }}>
@@ -616,41 +647,48 @@ export default function ProjectCoordinatorDashboard() {
                           </div>
                         )}
                       </div>
-                      {status !== 'assigned' && (
-                        <div className="flex gap-2 flex-wrap">
-                          {status !== 'approved' && (
-                            <button
-                              onClick={() => handleProjectStatus(m.email, 'approved')}
-                              disabled={loading || !m.projectName}
-                              className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50"
-                              style={{ background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.2)' }}>
-                              ✔ Approve
-                            </button>
-                          )}
-                          {status !== 'rejected' && (
-                            <button
-                              onClick={() => handleProjectStatus(m.email, 'rejected')}
-                              disabled={loading}
-                              className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50"
-                              style={{ background: 'rgba(239,68,68,0.1)', color: '#f87171', border: '1px solid rgba(239,68,68,0.2)' }}>
-                              ✗ Reject
-                            </button>
-                          )}
-                          {(status === 'approved') && (
-                            <button
-                              onClick={() => { 
-                                // Fetch mentee's project duration, default to 6_months if not set
-                                const menteeDuration = m.projectDuration || '6_months';
-                                setForm({ menteeEmail: m.email, mentorEmail: '', duration: menteeDuration }); 
-                                setTab('assign'); 
-                              }}
-                              className="px-3 py-1.5 rounded-lg text-xs font-medium"
-                              style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}>
-                              ➕ Assign Mentor
-                            </button>
-                          )}
-                        </div>
-                      )}
+                      <div className="flex gap-2 flex-wrap items-start">
+                        {status !== 'assigned' && (
+                          <>
+                            {status !== 'approved' && (
+                              <button
+                                onClick={() => handleProjectStatus(m.email, 'approved')}
+                                disabled={loading || !m.projectName}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50"
+                                style={{ background: 'rgba(99,102,241,0.12)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.2)' }}>
+                                ✔ Approve
+                              </button>
+                            )}
+                            {status !== 'rejected' && (
+                              <button
+                                onClick={() => handleProjectStatus(m.email, 'rejected')}
+                                disabled={loading}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50"
+                                style={{ background: 'rgba(239,68,68,0.1)', color: '#f87171', border: '1px solid rgba(239,68,68,0.2)' }}>
+                                ✗ Reject
+                              </button>
+                            )}
+                            {(status === 'approved') && (
+                              <button
+                                onClick={() => { 
+                                  const menteeDuration = m.projectDuration || '6_months';
+                                  setForm({ menteeEmail: m.email, mentorEmail: '', duration: menteeDuration }); 
+                                  setTab('assign'); 
+                                }}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                                style={{ background: 'rgba(236,72,153,0.1)', color: '#f472b6', border: '1px solid rgba(236,72,153,0.2)' }}>
+                                ➕ Assign Mentor
+                              </button>
+                            )}
+                          </>
+                        )}
+                        <button
+                          onClick={() => handleDeleteUser(m.email)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                          style={{ background: 'rgba(239,68,68,0.08)', color: '#f87171', border: '1px solid rgba(239,68,68,0.15)' }}>
+                          🗑 Remove
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );

@@ -6,6 +6,8 @@ const AWS = require("aws-sdk");
 const crypto = require("crypto");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const passport = require("passport");
+const session = require("express-session");
 require("dotenv").config();
 
 const { MongoClient, ObjectId } = require("mongodb");
@@ -79,13 +81,33 @@ const authLimiter = rateLimit({
 // BASIC MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════════════════
 
+// CORS must come first — before session and passport
+const corsOptions = {
+    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // handle preflight for all routes
+
 app.use(bodyParser.json());
 
-// CORS with environment-based origin
-app.use(cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
-    credentials: true
+// Session middleware for passport — saveUninitialized: true so session is saved before OAuth redirect
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'prp_session_secret_key_2024',
+  resave: false,
+  saveUninitialized: true,
+  cookie: {
+    secure: false, // must be false for localhost (no HTTPS)
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
 }));
+
+// Initialize Passport
+app.use(passport.initialize());
+app.use(passport.session());
 
 // Input sanitization to prevent NoSQL injection
 app.use(sanitizeBody);
@@ -107,6 +129,9 @@ async function connectDB() {
         projectsCollection = db.collection("projects");
         batchesCollection = db.collection("batches");
         console.log("✅ Connected to MongoDB");
+        
+        // Initialize Passport with database connection
+        require('./config/passport')(usersCollection);
         
         // Create database indexes for performance
         await createIndexes(db);
@@ -681,6 +706,30 @@ app.post("/api/signup", authLimiter, async (req, res) => {
         // ── Mentee: single-role, one account per email ───────────────────────
         if (role === 'mentee') {
             if (existingUser) {
+                // If account exists but is not verified, resend the verification email
+                if (!existingUser.isVerified) {
+                    const newToken = crypto.randomBytes(32).toString('hex');
+                    await usersCollection.updateOne(
+                        { email: normalizedEmail },
+                        { $set: { verificationToken: newToken } }
+                    );
+                    const verificationLink = `${process.env.FRONTEND_URL}/verify/${newToken}`;
+                    const { emailVerificationEmail } = require('./utils/emailService');
+                    setImmediate(async () => {
+                        try {
+                            const emailTemplate = emailVerificationEmail({ name: existingUser.name || name.trim(), verificationLink });
+                            await sendEmail({ to: normalizedEmail, ...emailTemplate });
+                            console.log('[Signup] Re-sent verification email to:', normalizedEmail);
+                        } catch (e) {
+                            console.error('[Email] Re-send verification email failed:', e.message);
+                        }
+                    });
+                    return res.status(200).json({
+                        success: true,
+                        message: "Account already exists but is not verified. A new verification email has been sent — please check your inbox.",
+                        requiresVerification: true
+                    });
+                }
                 return res.status(400).json({ success: false, message: "User already exists" });
             }
             
@@ -738,6 +787,7 @@ app.post("/api/signup", authLimiter, async (req, res) => {
             if (currentRoles.includes(role)) {
                 return res.status(400).json({ success: false, message: `You are already registered as ${role}.` });
             }
+            // Add new role — keep roles array updated, don't overwrite primary role field
             await usersCollection.updateOne(
                 { email: normalizedEmail },
                 { $addToSet: { roles: role } }
@@ -1283,6 +1333,15 @@ app.post("/api/login", authLimiter, async (req, res) => {
         const user = await usersCollection.findOne({ email: normalizedEmail });
         if (!user) return res.status(400).json({ success: false, message: "User not found" });
 
+        // Google-only users have no password — direct them to use Google Sign In
+        if (!user.password && user.authProvider === 'google') {
+            return res.status(400).json({ 
+                success: false, 
+                message: "This account uses Google Sign In. Please click 'Sign in with Google' instead.",
+                googleOnly: true
+            });
+        }
+
         // Support both bcrypt hashed and legacy plaintext passwords
         let passwordValid = false;
         if (user.password.startsWith('$2')) {
@@ -1303,14 +1362,16 @@ app.post("/api/login", authLimiter, async (req, res) => {
         }
 
         // Build effective roles array (support both old `role` string and new `roles` array)
-        const effectiveRoles = user.roles?.length ? user.roles : [user.role];
+        const effectiveRoles = (user.roles?.length ? user.roles : null) || [user.role];
 
         // If a specific role was requested, validate it
         if (role && !effectiveRoles.includes(role)) {
             return res.status(403).json({ success: false, message: `You are not registered as ${role}` });
         }
 
-        const resolvedRole = role || effectiveRoles[0];
+        // Default to first staff role (not mentee) if no role specified
+        const staffRoles = effectiveRoles.filter(r => r !== 'mentee');
+        const resolvedRole = role || (staffRoles.length > 0 ? staffRoles[0] : effectiveRoles[0]);
         const token = generateToken({ email: user.email, roles: effectiveRoles, name: user.name || '' }, resolvedRole);
 
         res.json({ success: true, token, role: resolvedRole, roles: effectiveRoles, name: user.name || '', email: user.email, userId: user._id });
@@ -1368,7 +1429,152 @@ app.get("/api/verify/:token", async (req, res) => {
     }
 });
 
+/*************** GOOGLE OAUTH AUTHENTICATION ***************/
+
+// Rate limiter for Google OAuth attempts
+const googleAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window
+  message: { success: false, message: 'Too many Google authentication attempts, please try again later.' }
+});
+
+// TEST ROUTE — verify callback URL is reachable
+app.get('/auth/google/callback/test', (req, res) => {
+  res.json({ success: true, message: 'Callback route is reachable', callbackURL: process.env.GOOGLE_CALLBACK_URL });
+});
+
+// GET /auth/google — initiate Google OAuth
+app.get('/auth/google', googleAuthLimiter, (req, res, next) => {
+  // Guard: detect if Google is actually calling back here (has 'code' AND 'state' from Google)
+  // Our frontend uses 'accessCode' not 'code', so req.query.code = Google's OAuth code
+  if (req.query.code && req.query.state && !req.query.role) {
+    console.warn('[Google OAuth] ⚠️  Google redirected to /auth/google instead of /auth/google/callback');
+    console.warn('[Google OAuth] Fix: In Google Console, set redirect URI to:', process.env.GOOGLE_CALLBACK_URL);
+    return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=misconfigured_redirect`);
+  }
+
+  const { role, accessCode } = req.query;
+
+  // Encode role and code into base64 state with our marker — survives the OAuth redirect round-trip
+  const stateData = Buffer.from(JSON.stringify({
+    _prp: 'prp_v1',       // our marker — distinguishes signup state from passport's internal state
+    role: role || 'mentee',
+    code: accessCode || null
+  })).toString('base64');
+
+  console.log('[Google OAuth] Initiating for role:', role || 'mentee');
+  console.log('[Google OAuth] Callback URL configured as:', process.env.GOOGLE_CALLBACK_URL);
+
+  passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    state: stateData,
+    session: false
+  })(req, res, next);
+});
+
+// GET /auth/google/callback — Google OAuth callback
+app.get('/auth/google/callback',
+  (req, res, next) => {
+    passport.authenticate('google', { session: false }, async (err, user, info) => {
+      if (err) {
+        console.error('[Google OAuth] Auth error:', err.message);
+        return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=server_error`);
+      }
+      if (!user) {
+        const reason = info?.message === 'invalid_code' ? 'invalid_code'
+          : info?.message === 'not_registered' ? 'not_registered'
+          : 'google_auth_failed';
+        console.warn('[Google OAuth] Auth failed:', info?.message);
+        return res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=${reason}`);
+      }
+
+      try {
+        const effectiveRoles = (user.roles?.length ? user.roles : null) || [user.role];
+        const primaryRole = user.role;
+        const token = generateToken(
+          { email: user.email, roles: effectiveRoles, name: user.name || '' },
+          primaryRole
+        );
+
+        console.log('[Google OAuth] Success:', user.email, '| Role:', primaryRole, '| All roles:', effectiveRoles);
+
+        // New user needs to complete their profile (choose role)
+        if (user.needsProfile) {
+          const redirectUrl = `${process.env.FRONTEND_URL}/auth/callback#token=${token}&needsProfile=true&email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+          return res.redirect(redirectUrl);
+        }
+
+        // Pass all roles so frontend can show role picker if needed
+        const redirectUrl = `${process.env.FRONTEND_URL}/auth/callback#token=${token}&role=${primaryRole}&roles=${encodeURIComponent(JSON.stringify(effectiveRoles))}&email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+        res.redirect(redirectUrl);
+      } catch (tokenErr) {
+        console.error('[Google OAuth] Token generation error:', tokenErr);
+        res.redirect(`${process.env.FRONTEND_URL}/auth/callback?error=server_error`);
+      }
+    })(req, res, next);
+  }
+);
+
 /*************** PASSWORD RESET ROUTES ***************/
+
+// GET /api/auth/profile-status — check if current token user needs profile completion
+app.get("/api/auth/profile-status", verifyToken, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({ email: req.user.email.toLowerCase() });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ success: true, needsProfile: !!user.needsProfile, role: user.role || null });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /api/auth/complete-profile — finalize Google user's role after OAuth
+app.post("/api/auth/complete-profile", verifyToken, async (req, res) => {
+  const { role, inviteCode, rollNo, contactNo } = req.body;
+  const email = req.user?.email;
+  if (!email) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+  const VALID_ROLES = ['mentee', 'mentor', 'project_coordinator', 'hod'];
+  if (!VALID_ROLES.includes(role))
+    return res.status(400).json({ success: false, message: "Invalid role selected." });
+
+  // Validate invite codes for staff roles
+  if (role === 'mentor' && inviteCode?.trim() !== process.env.MENTOR_INVITE_CODE)
+    return res.status(403).json({ success: false, message: "Invalid invite code for Mentor." });
+  if (role === 'project_coordinator' && inviteCode?.trim() !== process.env.COORD_CODE)
+    return res.status(403).json({ success: false, message: "Invalid invite code for Coordinator." });
+  if (role === 'hod' && inviteCode?.trim() !== process.env.HOD_CODE)
+    return res.status(403).json({ success: false, message: "Invalid invite code for HOD." });
+
+  try {
+    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (!user.needsProfile)
+      return res.status(400).json({ success: false, message: "Profile already completed." });
+
+    const update = {
+      role,
+      roles: [role],
+      needsProfile: false,
+    };
+    if (role === 'mentee') {
+      update.rollNo = rollNo?.trim() || '';
+      update.contactNo = contactNo?.toString().trim() || '';
+      update.projectStatus = 'pending';
+    }
+
+    await usersCollection.updateOne({ email: email.toLowerCase() }, { $set: update });
+
+    // Generate a fresh token with the real role
+    const token = generateToken({ email: email.toLowerCase(), roles: [role], name: user.name || '' }, role);
+    res.json({ success: true, role, token });
+  } catch (err) {
+    console.error('[complete-profile] Error:', err);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+
 
 const { generateOTP, hashOTP, verifyOTP } = require('./utils/otpService');
 const { passwordResetOTPEmail } = require('./utils/emailService');
@@ -1447,7 +1653,7 @@ app.post("/api/password/forgot", async (req, res) => {
  * Verify OTP before allowing password reset
  * Body: { email, otp }
  */
-app.post("/api/password/verify-otp", async (req, res) => {
+app.post("/api/password/verify-otp", authLimiter, async (req, res) => {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ success: false, message: "Email and OTP are required" });
 
@@ -1587,6 +1793,29 @@ app.get("/api/mentees", verifyToken, checkRole('project_coordinator', 'hod'), as
         res.json({ success: true, data: mentees });
     } catch (err) {
         res.status(500).json({ success: false, message: "Failed to fetch mentees" });
+    }
+});
+
+// DELETE /api/users/:email — remove a user account with full cascade (coordinator only)
+app.delete("/api/users/:email", verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
+    const email = req.params.email.toLowerCase();
+    try {
+        const user = await usersCollection.findOne({ email });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+        // Cascade delete all related data in parallel
+        await Promise.all([
+            usersCollection.deleteOne({ email }),
+            db.collection('assignments').deleteMany({ $or: [{ menteeEmail: email }, { mentorEmail: email }] }),
+            projectsCollection.deleteMany({ menteeEmail: email }),
+            db.collection('notifications').deleteMany({ recipientEmail: email }),
+            db.collection('files_metadata').deleteMany({ menteeEmail: email }),
+        ]);
+
+        res.json({ success: true, message: `User ${email} and all related data removed successfully` });
+    } catch (err) {
+        console.error('[DELETE USER]', err);
+        res.status(500).json({ success: false, message: "Failed to remove user" });
     }
 });
 
@@ -1919,6 +2148,12 @@ app.post("/api/assignments", verifyToken, checkRole('project_coordinator'), asyn
         if (!projectName) projectName = mentee.projectName || '';
         if (!projectName) return res.status(400).json({ success: false, message: "Mentee has no project name set" });
 
+        // Check active batch BEFORE making any changes
+        const activeBatch = await db.collection('batches').findOne({ isActive: true });
+        if (!activeBatch) {
+            return res.status(400).json({ success: false, message: "No active academic year found. Please set one first." });
+        }
+
         // Prevent duplicate: one mentee can only have one active assignment
         const existing = await db.collection("assignments").findOne({ 
             menteeEmail: menteeEmail.toLowerCase(),
@@ -1930,10 +2165,15 @@ app.post("/api/assignments", verifyToken, checkRole('project_coordinator'), asyn
             if (existingProject?.isCompleted || existing.finalRemark) {
                 return res.status(409).json({ 
                     success: false, 
-                    message: "This mentee's previous project is completed but not archived. Ask the mentee to create a new project first, which will archive the old assignment." 
+                    message: "This mentee's previous project is completed but not archived. Ask the mentee to create a new project first." 
                 });
             }
-            return res.status(409).json({ success: false, message: "This mentee already has an active assignment. Use update instead." });
+            // Sync projectStatus in case it's out of date — no side effects, just a repair
+            await usersCollection.updateOne(
+                { email: menteeEmail.toLowerCase(), projectStatus: { $ne: 'assigned' } },
+                { $set: { projectStatus: 'assigned' } }
+            );
+            return res.status(409).json({ success: false, message: "This mentee already has an active assignment." });
         }
 
         const result = await db.collection("assignments").insertOne({
@@ -1954,12 +2194,6 @@ app.post("/api/assignments", verifyToken, checkRole('project_coordinator'), asyn
         );
 
         // ADDED: upsert project doc with duration so phase validation works
-        // Get current active batch to ensure project is in correct academic year
-        const activeBatch = await db.collection('batches').findOne({ isActive: true });
-        if (!activeBatch) {
-            return res.status(400).json({ success: false, message: "No active academic year found. Please set one first." });
-        }
-        
         await projectsCollection.updateOne(
             { 
                 menteeEmail: menteeEmail.toLowerCase(),
@@ -2058,10 +2292,6 @@ app.post("/api/assignments/bulk-csv", verifyToken, checkRole('project_coordinato
 
             if (mentee.projectStatus === 'rejected') {
                 results.push({ menteeEmail, mentorEmail, duration, status: 'error', reason: 'Project was manually rejected — approve it first before assigning' }); continue;
-            }
-
-            if (mentee.projectStatus !== 'assigned') {
-                await usersCollection.updateOne({ email: menteeEmail }, { $set: { projectStatus: 'approved' } });
             }
 
             await db.collection('assignments').insertOne({
