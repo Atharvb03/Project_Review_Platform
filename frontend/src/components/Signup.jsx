@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { API } from '../config';
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
@@ -44,7 +45,7 @@ function Signup() {
     if (['mentor', 'project_coordinator'].includes(role) && !inviteCode.trim()) { setServerMessage('Invite code is required for this role.'); setIsSuccess(false); return; }
     setLoading(true);
     try {
-      const response = await axios.post('http://localhost:5000/api/signup', {
+      const response = await axios.post(`${API}/signup`, {
         name: name.trim(),
         email,
         password,

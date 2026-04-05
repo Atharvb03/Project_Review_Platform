@@ -19,6 +19,7 @@ async function createIndexes(db) {
 
     // Projects collection indexes
     await db.collection('projects').createIndex({ menteeEmail: 1, isArchived: 1 });
+    await db.collection('projects').createIndex({ menteeEmail: 1, projectName: 1, isArchived: 1 }); // for archived lookup by name
     await db.collection('projects').createIndex({ batchId: 1 });
     await db.collection('projects').createIndex({ isArchived: 1 });
 

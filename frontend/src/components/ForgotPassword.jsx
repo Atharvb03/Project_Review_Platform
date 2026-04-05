@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { API } from '../config';
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
@@ -26,7 +27,7 @@ function ForgotPassword() {
     setLoading(true);
     setMessage('');
     try {
-      const res = await axios.post('http://localhost:5000/api/password/forgot', { email: email.trim() });
+      const res = await axios.post(`${API}/password/forgot`, { email: email.trim() });
       setIsSuccess(true);
       setMessage(res.data.message);
       setStep(2);
@@ -48,7 +49,7 @@ function ForgotPassword() {
     setLoading(true);
     setMessage('');
     try {
-      const res = await axios.post('http://localhost:5000/api/password/verify-otp', { email: email.trim(), otp: otp.trim() });
+      const res = await axios.post(`${API}/password/verify-otp`, { email: email.trim(), otp: otp.trim() });
       setIsSuccess(true);
       setMessage(res.data.message);
       setStep(3);
@@ -80,7 +81,7 @@ function ForgotPassword() {
     setLoading(true);
     setMessage('');
     try {
-      const res = await axios.post('http://localhost:5000/api/password/reset', {
+      const res = await axios.post(`${API}/password/reset`, {
         email: email.trim(),
         otp: otp.trim(),
         newPassword,

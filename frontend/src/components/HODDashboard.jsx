@@ -4,7 +4,7 @@ import { useTheme } from "../context/ThemeContext";
 import { logout } from "../utils/auth";
 import { getAllowedPhases, PHASE_CONFIG } from '../utils/phases';
 
-const API = "http://localhost:5000/api";
+import { API } from '../config';
 
 // ── Stat card ──────────────────────────────────────────────
 function StatCard({ icon, label, value, color }) {

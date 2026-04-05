@@ -6,7 +6,7 @@ import { logout } from '../utils/auth';
 // ADDED: centralized phase config
 import { PHASE_CONFIG, getAllowedPhases } from '../utils/phases';
 
-const API = 'http://localhost:5000/api';
+import { API } from '../config';
 
 // REMOVED: hardcoded `sections` object — now derived dynamically from project duration
 
@@ -122,11 +122,12 @@ export default function MenteeDashboard() {
     }
   };
 
-  // Tick every second for countdown
+  // Tick every second for countdown — stop when project is finalised
   useEffect(() => {
+    if (assignment?.finalRemark) return; // no need to tick
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [assignment?.finalRemark]);
 
   // Fetch active academic year
   useEffect(() => {
@@ -352,7 +353,11 @@ export default function MenteeDashboard() {
       return phasesBeforeAchievements.every(k => uploads[k]);
     }
     // For other phases, check if all required phases are uploaded
-    return PHASE_CONFIG[key].required.every(r => uploads[r]);
+    // Use required_1year for finalDemo when project is 1 year
+    const requiredList = (key === 'finalDemo' && projectDuration === '1_year' && PHASE_CONFIG[key].required_1year)
+      ? PHASE_CONFIG[key].required_1year
+      : PHASE_CONFIG[key].required;
+    return requiredList.every(r => uploads[r]);
   };
 
   const handleUpload = async (e, key) => {
@@ -506,6 +511,7 @@ export default function MenteeDashboard() {
   const isPastDeadline = finalDeadline ? now > finalDeadline : false;
   const formatCountdown = () => {
     if (!finalDeadline) return null;
+    if (assignment?.finalRemark) return null; // project finalised — stop the timer
     const diff = finalDeadline - now;
     if (diff <= 0) return { label: 'Deadline passed', color: '#ef4444', urgent: true };
     const d = Math.floor(diff / 86400000);

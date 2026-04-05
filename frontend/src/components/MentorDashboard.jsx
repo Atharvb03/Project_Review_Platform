@@ -5,7 +5,7 @@ import { useTheme } from '../context/ThemeContext';
 import { logout } from '../utils/auth';
 import { PHASE_CONFIG, getAllowedPhases } from '../utils/phases';
 
-const API = 'http://localhost:5000/api';
+import { API } from '../config';
 
 export default function MentorDashboard() {
   const [assignments, setAssignments]       = useState([]);
@@ -248,7 +248,8 @@ export default function MentorDashboard() {
 
   // All uploaded files must have a non-pending remark before final submission
   const uploadedKeys = sectionKeys.filter(k => uploads[k]);
-  const allRemarked = uploadedKeys.length > 0 &&
+  const allUploaded  = sectionKeys.length > 0 && uploadedKeys.length === sectionKeys.length; // all phases have files
+  const allRemarked  = uploadedKeys.length > 0 &&
     uploadedKeys.every(k => uploads[k]?.remark && uploads[k].remark !== 'Pending Review');
 
   const submitFinalRemark = async () => {
@@ -528,7 +529,7 @@ export default function MentorDashboard() {
                           {dashData.mentees.map((m, i) => {
                             const finalDl = m.extendedDeadline || m.deadline;
                             return (
-                              <tr key={m.menteeEmail} style={{ borderBottom: i < dashData.mentees.length - 1 ? '1px solid rgba(236,72,153,0.06)' : 'none' }}>
+                              <tr key={`${m.menteeEmail}_${i}`} style={{ borderBottom: i < dashData.mentees.length - 1 ? '1px solid rgba(236,72,153,0.06)' : 'none' }}>
                                 <td className="px-4 py-3 font-medium text-left" style={{ color: 'var(--text-primary)' }}>{m.menteeName || m.menteeEmail}</td>
                                 <td className="px-4 py-3 text-left" style={{ color: 'var(--text-muted)' }}>{m.projectName}</td>
                                 <td className="px-4 py-3 text-center" style={{ color: '#10b981' }}>{m.stats.submitted}</td>
@@ -694,8 +695,11 @@ export default function MentorDashboard() {
               style={{ border: '1px solid rgba(99,102,241,0.2)' }}>
               <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>📅 Deadline Management</p>
 
-              {/* Both set — fully locked */}
-              {selectedAssignment.deadline && selectedAssignment.extendedDeadline ? (
+              {allUploaded ? (
+                <p className="text-xs px-3 py-2 rounded-lg" style={{ background: 'rgba(245,158,11,0.07)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.15)' }}>
+                  🔒 All files have been submitted. Deadline changes are no longer allowed.
+                </p>
+              ) : selectedAssignment.deadline && selectedAssignment.extendedDeadline ? (
                 <div className="space-y-2">
                   <div className="flex flex-wrap gap-3 text-xs">
                     <span className="px-3 py-1.5 rounded-lg" style={{ background: 'rgba(99,102,241,0.1)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.2)' }}>
@@ -709,8 +713,6 @@ export default function MentorDashboard() {
                     🔒 Deadline has been set and extended. No further changes allowed.
                   </p>
                 </div>
-
-              /* Deadline set, not yet extended — show extend only */
               ) : selectedAssignment.deadline ? (
                 <div className="space-y-2">
                   <div className="flex flex-wrap gap-3 text-xs mb-1">
@@ -720,36 +722,20 @@ export default function MentorDashboard() {
                   </div>
                   <p className="text-xs font-medium mb-1" style={{ color: 'var(--text-muted)' }}>Extend Deadline <span className="opacity-60">(one-time only)</span></p>
                   <div className="flex gap-2">
-                    <input
-                      type="datetime-local"
-                      value={extendInput}
-                      onChange={e => setExtendInput(e.target.value)}
-                      className="input-custom flex-1 px-2 py-1.5 rounded-lg text-xs"
-                    />
-                    <button
-                      onClick={handleExtendDeadline}
-                      disabled={deadlineLoading || !extendInput}
+                    <input type="datetime-local" value={extendInput} onChange={e => setExtendInput(e.target.value)} className="input-custom flex-1 px-2 py-1.5 rounded-lg text-xs" />
+                    <button onClick={handleExtendDeadline} disabled={deadlineLoading || !extendInput}
                       className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50 shrink-0"
                       style={{ background: 'rgba(16,185,129,0.12)', color: '#10b981', border: '1px solid rgba(16,185,129,0.2)' }}>
                       {deadlineLoading ? '⏳' : 'Extend'}
                     </button>
                   </div>
                 </div>
-
-              /* No deadline yet — show set only */
               ) : (
                 <div className="space-y-2">
                   <p className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>Set Deadline <span className="opacity-60">(one-time only)</span></p>
                   <div className="flex gap-2">
-                    <input
-                      type="datetime-local"
-                      value={deadlineInput}
-                      onChange={e => setDeadlineInput(e.target.value)}
-                      className="input-custom flex-1 px-2 py-1.5 rounded-lg text-xs"
-                    />
-                    <button
-                      onClick={handleSetDeadline}
-                      disabled={deadlineLoading || !deadlineInput}
+                    <input type="datetime-local" value={deadlineInput} onChange={e => setDeadlineInput(e.target.value)} className="input-custom flex-1 px-2 py-1.5 rounded-lg text-xs" />
+                    <button onClick={handleSetDeadline} disabled={deadlineLoading || !deadlineInput}
                       className="px-3 py-1.5 rounded-lg text-xs font-medium disabled:opacity-50 shrink-0"
                       style={{ background: 'rgba(99,102,241,0.15)', color: '#818cf8', border: '1px solid rgba(99,102,241,0.25)' }}>
                       {deadlineLoading ? '⏳' : 'Set'}

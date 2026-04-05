@@ -19,7 +19,7 @@ const { MongoClient } = require('mongodb');
 module.exports = {
   COLLECTION: 'file_metadata',
   ALLOWED_EXTENSIONS: ['pdf', 'ppt', 'pptx', 'mp4', 'mkv', 'docs', 'docx', 'txt', 'zip'],
-  MAX_SIZE_MB: 100,
+  MAX_SIZE_MB: 1000,
   // MIME type map for pre-signed PUT Content-Type header
   MIME_MAP: {
     pdf:  'application/pdf',

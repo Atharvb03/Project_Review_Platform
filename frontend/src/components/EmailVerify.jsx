@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { API } from '../config';
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
@@ -22,7 +23,7 @@ function EmailVerify() {
 
       try {
         console.log('[EmailVerify] Verifying token:', token);
-        const response = await axios.get(`http://localhost:5000/api/verify/${token}`);
+        const response = await axios.get(`${API}/verify/${token}`);
         console.log('[EmailVerify] Success:', response.data);
         setStatus('success');
         setMessage(response.data.message);

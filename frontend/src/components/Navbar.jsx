@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_BASE } from '../config';
 import { useNavigate } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
 
@@ -52,7 +53,7 @@ function Navbar() {
 
   // Fetch active academic year
   useEffect(() => {
-    fetch('http://localhost:5000/api/batches/active')
+    fetch(`${API_BASE}/api/batches/active`)
       .then(res => res.json())
       .then(data => {
         if (data.success && data.data) {

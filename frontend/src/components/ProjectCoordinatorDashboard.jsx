@@ -4,7 +4,7 @@ import { useTheme } from '../context/ThemeContext';
 import { logout } from '../utils/auth';
 import { getAllowedPhases, PHASE_CONFIG } from '../utils/phases';
 
-const API = 'http://localhost:5000/api';
+import { API } from '../config';
 
 // Reusable styled input/select for the dark/light theme
 function Field({ label, children }) {
@@ -186,7 +186,7 @@ export default function ProjectCoordinatorDashboard() {
       setBatches(batchList);
 
       const active = batchList.find(b => b.isActive);
-      if (active) setActiveBatch(active.name);
+      if (active) setActiveBatch(active);
 
       if (!initialTabSetRef.current) {
         initialTabSetRef.current = true;
@@ -440,7 +440,7 @@ export default function ProjectCoordinatorDashboard() {
           <div className="rounded-xl p-3 mb-2"
             style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.15)' }}>
             <p className="text-xs font-semibold mb-1" style={{ color: '#818cf8' }}>📅 Active Academic Year</p>
-            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch}</p>
+            <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{activeBatch?.name || activeBatch}</p>
           </div>
         )}
 
@@ -669,7 +669,8 @@ export default function ProjectCoordinatorDashboard() {
                         })()}
                       </div>
                       <div className="flex gap-2 flex-wrap items-start">
-                        {!isFinalised && status !== 'assigned' && (
+                        {/* Hide action buttons when: finalised, assigned, or completed but no new project yet */}
+                        {!isFinalised && status !== 'assigned' && !!m.projectName && (
                           <>
                             {status !== 'approved' && (
                               <button
@@ -693,7 +694,11 @@ export default function ProjectCoordinatorDashboard() {
                               <button
                                 onClick={() => { 
                                   const menteeDuration = m.projectDuration || '6_months';
-                                  setForm({ menteeEmail: m.email, mentorEmail: '', duration: menteeDuration }); 
+                                  const activeBatchId = activeBatch?._id?.toString();
+                                  const is2nd = activeBatchId
+                                    ? projects.some(p => p.mentee?.email === m.email && p.isArchived && p.batchId?.toString() === activeBatchId)
+                                    : false;
+                                  setForm({ menteeEmail: m.email, mentorEmail: '', duration: is2nd ? '6_months' : menteeDuration }); 
                                   setTab('assign'); 
                                 }}
                                 className="px-3 py-1.5 rounded-lg text-xs font-medium"
@@ -756,10 +761,30 @@ export default function ProjectCoordinatorDashboard() {
               </Field>
 
               <Field label="Project Duration">
-                <select className={inputCls} value={form.duration} onChange={e => setForm({ ...form, duration: e.target.value })}>
-                  <option value="6_months">6 Months</option>
-                  <option value="1_year">1 Year</option>
-                </select>
+                {(() => {
+                  // Only block 1-year if mentee has archived project IN THE CURRENT active batch
+                  const activeBatchId = activeBatch?._id?.toString();
+                  const is2ndProject = form.menteeEmail && activeBatchId
+                    ? projects.some(p =>
+                        p.mentee?.email === form.menteeEmail &&
+                        p.isArchived &&
+                        p.batchId?.toString() === activeBatchId
+                      )
+                    : false;
+                  return (
+                    <>
+                      <select className={inputCls} value={form.duration} onChange={e => setForm({ ...form, duration: e.target.value })}>
+                        <option value="6_months">6 Months</option>
+                        {!is2ndProject && <option value="1_year">1 Year</option>}
+                      </select>
+                      {is2ndProject && (
+                        <p className="text-xs mt-1" style={{ color: '#f59e0b' }}>
+                          ⚠ 1-year option unavailable — this is the 2nd project in the same academic year.
+                        </p>
+                      )}
+                    </>
+                  );
+                })()}
               </Field>
 
               <button
@@ -1021,11 +1046,38 @@ student2@college.com,mentor2@college.com,1_year`}
               </Field>
 
               <Field label="Project Duration (optional)">
-                <select className={inputCls} value={editForm.duration} onChange={e => setEditForm({ ...editForm, duration: e.target.value })}>
-                  <option value="">-- Keep current duration --</option>
-                  <option value="6_months">6 Months</option>
-                  <option value="1_year">1 Year</option>
-                </select>
+                {(() => {
+                  // Only block 1-year if mentee has archived project IN THE CURRENT active batch
+                  const selectedAssignment = assignments.find(a => a._id === editId);
+                  const activeBatchId = activeBatch?._id?.toString();
+                  const is2nd6Month = selectedAssignment && activeBatchId
+                    ? projects.some(p =>
+                        p.mentee?.email === selectedAssignment.menteeEmail &&
+                        p.isArchived &&
+                        p.batchId?.toString() === activeBatchId
+                      )
+                    : false;
+
+                  return (
+                    <select className={inputCls} value={editForm.duration} onChange={e => setEditForm({ ...editForm, duration: e.target.value })}>
+                      <option value="">-- Keep current duration --</option>
+                      <option value="6_months">6 Months</option>
+                      {!is2nd6Month && <option value="1_year">1 Year</option>}
+                    </select>
+                  );
+                })()}
+                {assignments.find(a => a._id === editId) && (() => {
+                  const sel = assignments.find(a => a._id === editId);
+                  const activeBatchId = activeBatch?._id?.toString();
+                  const show = activeBatchId && projects.some(p =>
+                    p.mentee?.email === sel?.menteeEmail && p.isArchived && p.batchId?.toString() === activeBatchId
+                  );
+                  return show ? (
+                    <p className="text-xs mt-1" style={{ color: '#f59e0b' }}>
+                      ⚠ 1-year option unavailable — this is the 2nd project in the same academic year.
+                    </p>
+                  ) : null;
+                })()}
               </Field>
 
               <button

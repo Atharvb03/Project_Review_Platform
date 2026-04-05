@@ -1,13 +1,10 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
+import { API_BASE } from '../config';
 
-// Pure pass-through — immediately redirects to Google OAuth.
-// Role selection happens on /complete-profile for new users.
-// Existing users go straight to their dashboard via GoogleCallback.
 function GoogleLogin() {
   useEffect(() => {
-    window.location.href = 'http://localhost:5000/auth/google';
+    window.location.href = `${API_BASE}/auth/google`;
   }, []);
-
   return null;
 }
 

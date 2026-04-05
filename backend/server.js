@@ -62,19 +62,30 @@ app.use(helmet({
 
 // Rate limiting to prevent brute force and DoS attacks
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutes
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100, // limit each IP to 100 requests per windowMs
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || (process.env.NODE_ENV === 'production' ? 200 : 1000),
   message: { success: false, message: 'Too many requests, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
+  // Include CORS headers even on rate-limited responses
+  handler: (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || 'http://localhost:5173');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.status(429).json({ success: false, message: 'Too many requests, please try again later.' });
+  },
 });
 app.use('/api/', limiter);
 
 // Stricter rate limit for auth endpoints
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 requests per window
-  message: { success: false, message: 'Too many authentication attempts, please try again later.' }
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 5 : 50,
+  message: { success: false, message: 'Too many authentication attempts, please try again later.' },
+  handler: (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || 'http://localhost:5173');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.status(429).json({ success: false, message: 'Too many authentication attempts, please try again later.' });
+  },
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -471,16 +482,18 @@ app.get('/api/files/metadata/:menteeEmail', requireRole('mentee', 'mentor', 'hod
       .toArray();
 
     // Enrich archived files with academic year (batch) name
-    const enrichedArchivedFiles = await Promise.all(archivedFiles.map(async (f) => {
-      // Find the archived assignment matching this file's project
+    // Batch lookup: collect unique batchIds from archived assignments, fetch all at once
+    const batchIdSet = new Set(archivedAssignments.map(a => a.batchId?.toString()).filter(Boolean));
+    const batches = batchIdSet.size > 0
+      ? await batchesCollection.find({ _id: { $in: archivedAssignments.map(a => a.batchId).filter(Boolean) } }).toArray()
+      : [];
+    const batchMap = Object.fromEntries(batches.map(b => [b._id.toString(), b.name]));
+
+    const enrichedArchivedFiles = archivedFiles.map(f => {
       const matchingAssignment = archivedAssignments.find(a => a.projectName === f.archivedProjectName);
-      let batchName = null;
-      if (matchingAssignment?.batchId) {
-        const batch = await batchesCollection.findOne({ _id: matchingAssignment.batchId });
-        batchName = batch?.name || null;
-      }
+      const batchName = matchingAssignment?.batchId ? batchMap[matchingAssignment.batchId.toString()] || null : null;
       return { ...f, batchName };
-    }));
+    });
     
     console.log(`[FILES] Found ${activeFiles.length} active files and ${archivedFiles.length} archived files for ${menteeEmail}${projectName ? ` (project: ${projectName})` : ''}`);
     
@@ -2089,47 +2102,47 @@ app.get("/api/mentor-projects", verifyToken, checkRole('mentor'), async (req, re
 app.get("/api/hod/project-details", verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
     try {
         const assignments = await db.collection("assignments").find({}).toArray();
-        const detailed = await Promise.all(
-            assignments.map(async (a) => {
-                const mentor  = await usersCollection.findOne({ email: a.mentorEmail });
-                const mentee  = await usersCollection.findOne({ email: a.menteeEmail });
-                
-                // Find the project that matches this assignment
-                // If assignment is archived, find archived project with matching name
-                // If assignment is active, find active project
-                let project;
-                if (a.isArchived) {
-                    project = await projectsCollection.findOne({ 
-                        menteeEmail: a.menteeEmail,
-                        projectName: a.projectName,
-                        isArchived: true
-                    });
-                } else {
-                    project = await projectsCollection.findOne({ 
-                        menteeEmail: a.menteeEmail,
-                        isArchived: { $ne: true }
-                    });
-                }
-                
-                // duration: project doc is most up-to-date, fall back to assignment doc
-                const duration = project?.duration || a.duration || '6_months';
-                return {
-                    _id: a._id,
-                    projectName: a.projectName,
-                    duration,
-                    batchId: project?.batchId || null,
-                    isArchived: a.isArchived || false, // ADDED: Include archived status
-                    mentor: mentor ? { email: mentor.email, name: mentor.name || '' } : { email: a.mentorEmail, name: '' },
-                    mentee: mentee ? { email: mentee.email, name: mentee.name || '', rollNo: mentee.rollNo || '', contactNo: mentee.contactNo || '' } : { email: a.menteeEmail, name: '', rollNo: '', contactNo: '' },
-                    groupMembers: mentee?.groupMembers || [],
-                    assignedBy: a.assignedBy,
-                    createdAt: a.createdAt,
-                    updatedAt: a.updatedAt,
-                    finalRemark: a.finalRemark || null,
-                    finalRemarkedAt: a.finalRemarkedAt || null,
-                };
-            })
-        );
+
+        // Batch fetch all unique mentors, mentees, and projects in parallel
+        const mentorEmails = [...new Set(assignments.map(a => a.mentorEmail).filter(Boolean))];
+        const menteeEmails = [...new Set(assignments.map(a => a.menteeEmail).filter(Boolean))];
+
+        const [mentorDocs, menteeDocs, projectDocs] = await Promise.all([
+            usersCollection.find({ email: { $in: mentorEmails } }).toArray(),
+            usersCollection.find({ email: { $in: menteeEmails } }).toArray(),
+            projectsCollection.find({ menteeEmail: { $in: menteeEmails } }).toArray(),
+        ]);
+
+        const mentorMap  = Object.fromEntries(mentorDocs.map(u => [u.email, u]));
+        const menteeMap  = Object.fromEntries(menteeDocs.map(u => [u.email, u]));
+
+        const detailed = assignments.map(a => {
+            const mentor = mentorMap[a.mentorEmail];
+            const mentee = menteeMap[a.menteeEmail];
+
+            // Match project: archived assignment → archived project with same name; active → active project
+            const project = a.isArchived
+                ? projectDocs.find(p => p.menteeEmail === a.menteeEmail && p.projectName === a.projectName && p.isArchived)
+                : projectDocs.find(p => p.menteeEmail === a.menteeEmail && !p.isArchived);
+
+            const duration = project?.duration || a.duration || '6_months';
+            return {
+                _id: a._id,
+                projectName: a.projectName,
+                duration,
+                batchId: project?.batchId || a.batchId || null,
+                isArchived: a.isArchived || false,
+                mentor: mentor ? { email: mentor.email, name: mentor.name || '' } : { email: a.mentorEmail, name: '' },
+                mentee: mentee ? { email: mentee.email, name: mentee.name || '', rollNo: mentee.rollNo || '', contactNo: mentee.contactNo || '' } : { email: a.menteeEmail, name: '', rollNo: '', contactNo: '' },
+                groupMembers: mentee?.groupMembers || [],
+                assignedBy: a.assignedBy,
+                createdAt: a.createdAt,
+                updatedAt: a.updatedAt,
+                finalRemark: a.finalRemark || null,
+                finalRemarkedAt: a.finalRemarkedAt || null,
+            };
+        });
+
         res.json({ success: true, data: detailed });
     } catch (err) {
         res.status(500).json({ success: false, message: "Failed to fetch HOD project details" });
@@ -2447,25 +2460,24 @@ app.get("/api/assignments/mentor/:email", verifyToken, checkRole('mentor', 'proj
         .sort({ isArchived: 1, updatedAt: -1 }) // Active first, then by most recent
         .toArray();
         
-        // Enrich each assignment and filter by active academic year
-        const enriched = await Promise.all(assignments.map(async (a) => {
-            const mentee = await usersCollection.findOne({ email: a.menteeEmail });
-            // For archived assignments, look for archived project with matching name; for active, look for active project
+        // Batch fetch all mentees and projects at once
+        const menteeEmails = [...new Set(assignments.map(a => a.menteeEmail).filter(Boolean))];
+        const [menteeDocs, projectDocs] = await Promise.all([
+            usersCollection.find({ email: { $in: menteeEmails } }).toArray(),
+            projectsCollection.find({ menteeEmail: { $in: menteeEmails } }).toArray(),
+        ]);
+        const menteeMap  = Object.fromEntries(menteeDocs.map(u => [u.email, u]));
+
+        const enriched = assignments.map(a => {
+            const mentee = menteeMap[a.menteeEmail];
             const project = a.isArchived
-                ? await projectsCollection.findOne({ menteeEmail: a.menteeEmail, projectName: a.projectName, isArchived: true })
-                : await projectsCollection.findOne({ menteeEmail: a.menteeEmail, isArchived: { $ne: true } });
+                ? projectDocs.find(p => p.menteeEmail === a.menteeEmail && p.projectName === a.projectName && p.isArchived)
+                : projectDocs.find(p => p.menteeEmail === a.menteeEmail && !p.isArchived);
 
             const duration = project?.duration || a.duration || '6_months';
-            // batchId: prefer project doc, fall back to assignment doc itself
-            const batchId = project?.batchId || a.batchId || null;
-            return { 
-                ...a, 
-                duration, 
-                groupMembers: mentee?.groupMembers || [], 
-                menteeName: mentee?.name || '',
-                batchId
-            };
-        }));
+            const batchId  = project?.batchId || a.batchId || null;
+            return { ...a, duration, groupMembers: mentee?.groupMembers || [], menteeName: mentee?.name || '', batchId };
+        });
         
         // Filter to only show projects from the active academic year
         // Include assignments with no batchId (legacy data) so they're not silently hidden
@@ -2754,6 +2766,24 @@ app.put("/api/assignments/:id", verifyToken, checkRole('project_coordinator'), a
         // Fetch BEFORE update so we have the old values
         const oldAssignment = await db.collection("assignments").findOne({ _id: new ObjectId(req.params.id) });
         if (!oldAssignment) return res.status(404).json({ success: false, message: "Assignment not found" });
+
+        // Block changing to 1_year if mentee already has a completed (archived) 6-month project IN THE SAME batch
+        if (duration === '1_year') {
+            const activeBatch = await batchesCollection.findOne({ isActive: true });
+            if (activeBatch) {
+                const archivedInBatch = await projectsCollection.findOne({
+                    menteeEmail: oldAssignment.menteeEmail,
+                    isArchived: true,
+                    batchId: activeBatch._id
+                });
+                if (archivedInBatch) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Cannot change to 1-year — this is the 2nd project in the same academic year. Only 6-month duration is allowed."
+                    });
+                }
+            }
+        }
 
         const result = await db.collection("assignments").updateOne(
             { _id: new ObjectId(req.params.id) },

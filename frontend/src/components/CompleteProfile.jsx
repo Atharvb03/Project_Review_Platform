@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
 
-const API = 'http://localhost:5000/api';
+import { API } from '../config';
 
 const ROLES = [
   { value: 'mentee',              label: 'Mentee',              icon: '📚', desc: 'Submit and get feedback on projects', requiresCode: false },

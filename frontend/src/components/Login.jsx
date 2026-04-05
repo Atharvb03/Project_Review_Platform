@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { API } from '../config';
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
@@ -58,7 +59,7 @@ function Login() {
     setAvailableRoles(null);
     setPendingData(null);
     try {
-      const response = await axios.post('http://localhost:5000/api/login', { email, password });
+      const response = await axios.post(`${API}/login`, { email, password });
       const { success, roles, email: normalizedEmail, name, token } = response.data;
       if (success) {
         const storedEmail = normalizedEmail || email.toLowerCase();

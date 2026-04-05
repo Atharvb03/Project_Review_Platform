@@ -42,7 +42,8 @@ export const PHASE_CONFIG = {
   finalDemo: {
     label: 'Final Demo',
     allowedTypes: ['mp4', 'mkv'],
-    required: ['phase1Report'],   // 6_months: after phase1Report; 1_year: after finalReport (handled by getAllowedPhases ordering)
+    required: ['phase1Report'],        // 6_months: unlocks after phase1Report
+    required_1year: ['finalReport'],   // 1_year: unlocks after finalReport
   },
   finalPpt: {
     label: 'Final PPT',
