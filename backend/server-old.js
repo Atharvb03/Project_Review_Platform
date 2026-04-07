@@ -1282,38 +1282,42 @@ app.get("/api/mentee/status", requireRole('mentee'), async (req, res) => {
             isArchived: { $ne: true } // Only get active project
         });
 
-        // If no active assignment/project, fall back to most recent archived ones for display
-        // For 1-year completed projects OR mentee who has completed both 6-month projects
-        const archivedAssignment = !assignment ? await db.collection("assignments").findOne(
+        // ADDED: Check project limits in current academic year
+        const activeBatch = await batchesCollection.findOne({ isActive: true });
+
+        // If the active project belongs to a DIFFERENT batch than the current active one,
+        // treat it as "no project in this batch" so the mentee sees the create form
+        const projectInCurrentBatch = project && activeBatch
+            ? (!project.batchId || project.batchId.toString() === activeBatch._id.toString())
+            : !!project;
+        const effectiveActiveProject = projectInCurrentBatch ? project : null;
+        const effectiveActiveAssignment = projectInCurrentBatch ? assignment : null;
+
+        // If no active assignment/project IN CURRENT BATCH, fall back to most recent archived ones for display
+        const archivedAssignment = !effectiveActiveAssignment ? await db.collection("assignments").findOne(
             { menteeEmail: req.userEmail, isArchived: true },
             { sort: { archivedAt: -1 } }
         ) : null;
-        const archivedProject = !project ? await projectsCollection.findOne(
+        const archivedProject = !effectiveActiveProject ? await projectsCollection.findOne(
             { menteeEmail: req.userEmail, isArchived: true },
             { sort: { archivedAt: -1 } }
         ) : null;
 
-        // Only use archived fallback if:
-        // 1. It's a 1-year project, OR
-        // 2. Mentee has at least 1 completed 6-month project (show archived view until new project is created)
-        const archivedCount = !assignment ? await db.collection("assignments").countDocuments(
+        const archivedCount = !effectiveActiveAssignment ? await db.collection("assignments").countDocuments(
             { menteeEmail: req.userEmail, isArchived: true }
         ) : 0;
         const use6MonthFallback = archivedCount >= 1 && archivedProject?.duration === '6_months';
         const use1YearFallback  = archivedProject?.duration === '1_year';
         const useArchivedFallback = use1YearFallback || use6MonthFallback;
 
-        const effectiveAssignment = assignment || (useArchivedFallback ? archivedAssignment : null);
-        const effectiveProject    = project    || (useArchivedFallback ? archivedProject    : null);
+        const effectiveAssignment = effectiveActiveAssignment || (useArchivedFallback ? archivedAssignment : null);
+        const effectiveProject    = effectiveActiveProject    || (useArchivedFallback ? archivedProject    : null);
 
         const resolvedDuration = effectiveProject?.duration || effectiveAssignment?.duration || '6_months';
-
-        // Check if current project is completed
         const isProjectCompleted = effectiveProject?.isCompleted || effectiveAssignment?.finalRemark || false;
-        
-        // ADDED: Check project limits in current academic year
-        const activeBatch = await batchesCollection.findOne({ isActive: true });
-        let canCreateNewProject = !user.projectName || isProjectCompleted || user.projectStatus === 'rejected';
+
+        // canCreateNewProject: true if no active project in current batch
+        let canCreateNewProject = !effectiveActiveProject || isProjectCompleted || user.projectStatus === 'rejected';
         let projectLimitReason = null;
         let completed6MonthCount = 0;
         let has1YearCompleted = false;
@@ -1364,14 +1368,14 @@ app.get("/api/mentee/status", requireRole('mentee'), async (req, res) => {
                 name: user.name || '',
                 rollNo: user.rollNo || '',
                 contactNo: user.contactNo || '',
-                projectName: user.projectName || (useArchivedFallback ? effectiveProject?.projectName || effectiveAssignment?.projectName : '') || '',
-                projectDuration: user.projectDuration || effectiveProject?.duration || '6_months',
-                projectDescription: user.projectDescription || (useArchivedFallback ? effectiveProject?.description : '') || '',
-                projectStatus: user.projectStatus || 'pending',
+                projectName: effectiveActiveProject?.projectName || (useArchivedFallback ? effectiveProject?.projectName || effectiveAssignment?.projectName : '') || '',
+                projectDuration: effectiveActiveProject?.duration || user.projectDuration || effectiveProject?.duration || '6_months',
+                projectDescription: effectiveActiveProject?.description || user.projectDescription || (useArchivedFallback ? effectiveProject?.description : '') || '',
+                projectStatus: effectiveActiveProject ? (user.projectStatus || 'pending') : 'pending',
                 groupMembers: user.groupMembers || [],
-                assignment: (useArchivedFallback ? effectiveAssignment : assignment) || null,
-                deadline: (useArchivedFallback ? effectiveAssignment : assignment)?.deadline || null,
-                extendedDeadline: (useArchivedFallback ? effectiveAssignment : assignment)?.extendedDeadline || null,
+                assignment: (useArchivedFallback ? effectiveAssignment : effectiveActiveAssignment) || null,
+                deadline: (useArchivedFallback ? effectiveAssignment : effectiveActiveAssignment)?.deadline || null,
+                extendedDeadline: (useArchivedFallback ? effectiveAssignment : effectiveActiveAssignment)?.extendedDeadline || null,
                 duration: resolvedDuration,
                 isProjectCompleted,
                 canCreateNewProject,
