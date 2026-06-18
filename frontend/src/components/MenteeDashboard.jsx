@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from '../api/axiosInstance';
 import { useTheme } from '../context/ThemeContext';
@@ -140,13 +140,10 @@ export default function MenteeDashboard() {
       .catch(() => {});
   }, []);
 
-  // Initial load
-  useEffect(() => {
-    // Always fetch files to get archived files even if no active project
-    fetchFiles(true);
-    
-    // Fetch mentee status (project name, status, assignment, notifications)
-    axios.get(`${API}/mentee/status`).then(r => {
+  // Reusable: fetch mentee status and update all state
+  const fetchStatus = useCallback(async (silent = true) => {
+    try {
+      const r = await axios.get(`${API}/mentee/status`);
       const d = r.data.data;
       setMenteeName(d.name || '');
       setProjectName(d.projectName || '');
@@ -156,42 +153,51 @@ export default function MenteeDashboard() {
       setAssignment(d.assignment);
       setNotifications(d.notifications || []);
       setGroupMembers(d.groupMembers || []);
-      // Pre-fill profile draft with latest values from DB
       setProfileDraft({ name: d.name || '', rollNo: d.rollNo || '', contactNo: d.contactNo || '' });
       if (d.deadline) setDeadline(new Date(d.deadline));
       if (d.extendedDeadline) setExtendedDeadline(new Date(d.extendedDeadline));
-      // ADDED: set project duration to drive phase rendering
       if (d.duration) setProjectDuration(d.duration);
-      // ADDED: lock uploads if project is finalised
-      // Only set finalRemark if assignment exists and is not archived
       if (d.assignment?.finalRemark && !d.assignment?.isArchived) {
         setProjectFinalRemark(d.assignment.finalRemark);
         setIsProjectArchived(false);
       } else if (d.assignment?.isArchived) {
-        // Assignment is archived — project is completed, hide upload phases
         setProjectFinalRemark(d.assignment?.finalRemark || null);
         setIsProjectArchived(true);
       } else {
         setProjectFinalRemark(null);
         setIsProjectArchived(false);
       }
-      // ADDED: check if mentee can create new project
       setCanCreateNewProject(d.canCreateNewProject !== false);
       setProjectLimitReason(d.projectLimitReason || null);
       setCompleted6MonthCount(d.completed6MonthCount || 0);
-      
-      // Fetch files — always fetch to get archived files even if no active project
-      fetchFiles(true);
-      
+      return d;
+    } catch {
+      return null;
+    }
+  }, []); // eslint-disable-line
+
+  // Initial load
+  useEffect(() => {
+    fetchFiles(true);
+    fetchStatus(true).then(d => {
+      if (d) fetchFiles(true);
       setInitialLoading(false);
     }).catch(() => {
-      // fallback: try assignment endpoint
       axios.get(`${API}/assignments/mentee/${menteeEmail}`)
         .then(r => setAssignment(r.data.data))
         .catch(() => setAssignment(null))
         .finally(() => setInitialLoading(false));
     });
   }, [menteeEmail, userRole]); // eslint-disable-line
+
+  // Poll every 30s for updates (e.g. mentor gives final remark while mentee is on the page)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchStatus(true);
+      fetchFiles(true);
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [fetchStatus]); // eslint-disable-line
 
   const handleUpdateProjectName = async () => {
     if (!newProjectName.trim()) return;
@@ -265,11 +271,11 @@ export default function MenteeDashboard() {
         description: '',
         groupMembers: [],
       });
-      
-      // Refresh the entire page to load fresh data
-      setTimeout(() => {
-        window.location.reload();
-      }, 1000);
+      setShowCreateProject(false);
+
+      // Refresh state without page reload
+      await fetchStatus(true);
+      fetchFiles(true);
     } catch (err) {
       console.error('Create project error:', err);
       console.error('Error response:', err.response?.data);
@@ -335,10 +341,12 @@ export default function MenteeDashboard() {
   }, [projectName, activeTab, initialLoading]); // eslint-disable-line
 
   // Re-fetch silently whenever the tab becomes visible again
-  // This ensures mentor remarks updated while the mentee was on another tab show up immediately
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible') fetchFiles(true);
+      if (document.visibilityState === 'visible') {
+        fetchFiles(true);
+        fetchStatus(true); // also re-fetch status to catch mentor remarks/final remark
+      }
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);

@@ -10,6 +10,7 @@ const { ObjectId } = require('mongodb');
 
 const { getCollections }       = require('../db');
 const { verifyToken, checkRole } = require('../middleware/auth');
+const cache = require('../services/cacheService');
 
 // GET / — list all batches
 router.get('/', verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
@@ -60,6 +61,7 @@ router.patch('/:id/activate', verifyToken, checkRole('project_coordinator'), asy
     if (!batch) return res.status(404).json({ success: false, message: 'Academic year not found' });
     await batchesCollection.updateMany({ _id: { $ne: batchId } }, { $set: { isActive: false, updatedAt: new Date() } });
     await batchesCollection.updateOne({ _id: batchId }, { $set: { isActive: true, updatedAt: new Date() } });
+    cache.flush(); // batch changed — all cached data is now stale
     res.json({ success: true, message: `Academic year ${batch.name} is now active` });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to activate batch' });

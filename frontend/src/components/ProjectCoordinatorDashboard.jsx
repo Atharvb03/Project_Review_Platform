@@ -281,7 +281,17 @@ export default function ProjectCoordinatorDashboard() {
     try {
       const res = await axios.patch(`${API}/batches/${id}/activate`);
       flash(res.data.message, 'success');
-      fetchBatches();
+      // Re-fetch everything so all tabs immediately show the new year's data
+      await Promise.all([
+        fetchBatches(),
+        fetchMentees(1, false),
+        fetchAssignments(1, false),
+        fetchProjects(),
+        axios.get(`${API}/mentors`).then(r => setMentors(r.data.data || [])).catch(() => {}),
+      ]);
+      // Reset pagination to page 1 for both lists
+      setMenteesPage(1);
+      setAssignmentsPage(1);
     } catch (err) {
       flash(err.response?.data?.message || 'Failed to activate batch', 'error');
     }

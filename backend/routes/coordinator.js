@@ -41,22 +41,32 @@ router.get('/mentors', verifyToken, checkRole('project_coordinator', 'hod'), asy
   } catch (err) { res.status(500).json({ success: false, message: 'Failed to fetch mentors' }); }
 });
 
-// GET /mentees — paginated + cached
-// Query params: page (default 1), limit (default 50, max 200)
-// Cache TTL: 60 seconds. Invalidated on any mentee create/update/delete.
+// GET /mentees — paginated + cached, filtered by active batch
 router.get('/mentees', verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
-  const { usersCollection } = getCollections();
+  const { db, usersCollection, projectsCollection } = getCollections();
   const { page, limit, skip } = parsePagination(req.query);
-  const cacheKey = `mentees:${page}:${limit}`;
-
-  // Serve from cache if available
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    return res.json({ ...cached, fromCache: true });
-  }
 
   try {
-    const filter = { $or: [{ role: 'mentee' }, { roles: 'mentee' }] };
+    const activeBatch = await db.collection('batches').findOne({ isActive: true });
+    const batchKey = activeBatch?._id?.toString() || 'no-batch';
+    const cacheKey = `mentees:${batchKey}:${page}:${limit}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json({ ...cached, fromCache: true });
+
+    // Only show mentees who have a project in the current active batch
+    let emailFilter = null;
+    if (activeBatch) {
+      const projectsInBatch = await projectsCollection
+        .find({ batchId: activeBatch._id }, { projection: { menteeEmail: 1 } })
+        .toArray();
+      emailFilter = [...new Set(projectsInBatch.map(p => p.menteeEmail).filter(Boolean))];
+    }
+
+    const filter = emailFilter !== null
+      ? { $or: [{ role: 'mentee' }, { roles: 'mentee' }], email: { $in: emailFilter } }
+      : { $or: [{ role: 'mentee' }, { roles: 'mentee' }] };
+
     const projection = { email: 1, name: 1, rollNo: 1, contactNo: 1, projectName: 1, projectDuration: 1, projectStatus: 1, groupMembers: 1 };
 
     const [mentees, totalRecords] = await Promise.all([
@@ -65,7 +75,7 @@ router.get('/mentees', verifyToken, checkRole('project_coordinator', 'hod'), asy
     ]);
 
     const response = paginatedResponse(mentees, totalRecords, page, limit);
-    cache.set(cacheKey, response, 60); // cache for 60 seconds
+    cache.set(cacheKey, response, 60);
     res.json(response);
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to fetch mentees' });
@@ -129,11 +139,23 @@ router.get('/mentor-projects', verifyToken, checkRole('mentor'), async (req, res
   } catch (err) { res.status(500).json({ success: false, message: 'Failed to fetch mentor projects' }); }
 });
 
-// GET /hod/project-details
+// GET /hod/project-details — active batch projects + all archived projects from all years
 router.get('/hod/project-details', verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
   const { db, usersCollection, projectsCollection } = getCollections();
   try {
-    const assignments = await db.collection('assignments').find({}).toArray();
+    const activeBatch = await db.collection('batches').findOne({ isActive: true });
+
+    // Active batch assignments (current year) + ALL archived assignments (all years)
+    const activeFilter   = activeBatch
+      ? { isArchived: { $ne: true }, $or: [{ batchId: activeBatch._id }, { batchId: null }, { batchId: { $exists: false } }] }
+      : { isArchived: { $ne: true } };
+    const archivedFilter = { isArchived: true }; // all years
+
+    const [activeAssignments, archivedAssignments] = await Promise.all([
+      db.collection('assignments').find(activeFilter).toArray(),
+      db.collection('assignments').find(archivedFilter).toArray(),
+    ]);
+    const assignments = [...activeAssignments, ...archivedAssignments];
     const mentorEmails = [...new Set(assignments.map(a => a.mentorEmail).filter(Boolean))];
     const menteeEmails = [...new Set(assignments.map(a => a.menteeEmail).filter(Boolean))];
     const [mentorDocs, menteeDocs, projectDocs] = await Promise.all([
@@ -166,14 +188,18 @@ router.post('/hod/presigned-url', verifyToken, checkRole('hod', 'project_coordin
   } catch (err) { res.status(500).json({ success: false, message: 'Failed to generate pre-signed URL' }); }
 });
 
-// GET /hod/stats
+// GET /hod/stats — filtered by active batch
 router.get('/hod/stats', verifyToken, checkRole('hod', 'project_coordinator'), async (req, res) => {
   const { db, usersCollection } = getCollections();
   try {
+    const activeBatch = await db.collection('batches').findOne({ isActive: true });
+    const assignmentFilter = activeBatch
+      ? { $or: [{ batchId: activeBatch._id }, { batchId: null }, { batchId: { $exists: false } }] }
+      : {};
     const [mentorCount, menteeCount, assignmentCount] = await Promise.all([
       usersCollection.countDocuments({ $or: [{ role: 'mentor' }, { roles: 'mentor' }] }),
       usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }] }),
-      db.collection('assignments').countDocuments(),
+      db.collection('assignments').countDocuments(assignmentFilter),
     ]);
     res.json({ success: true, data: { mentors: mentorCount, mentees: menteeCount, assignments: assignmentCount } });
   } catch (err) { res.status(500).json({ success: false, message: 'Failed to fetch stats' }); }

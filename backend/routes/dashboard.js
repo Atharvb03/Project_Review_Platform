@@ -59,14 +59,19 @@ router.get('/mentor/:email', requireRole('mentor'), async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// GET /coordinator
+// GET /coordinator — filtered by active batch
 router.get('/coordinator', verifyToken, checkRole('project_coordinator'), async (req, res) => {
   const { db, usersCollection } = getCollections();
   try {
+    const activeBatch = await db.collection('batches').findOne({ isActive: true });
+    const batchFilter = activeBatch
+      ? { $or: [{ batchId: activeBatch._id }, { batchId: null }, { batchId: { $exists: false } }] }
+      : {};
+
     const [totalStudents, totalMentors, assignments, allFiles] = await Promise.all([
       usersCollection.countDocuments({ $or: [{ role: 'mentee' }, { roles: 'mentee' }] }),
       usersCollection.countDocuments({ $or: [{ role: 'mentor' }, { roles: 'mentor' }] }),
-      db.collection('assignments').find({ isArchived: { $ne: true } }).toArray(),
+      db.collection('assignments').find({ ...batchFilter, isArchived: { $ne: true } }).toArray(),
       db.collection(FILE_COL).find({ isArchived: { $ne: true } }).toArray(),
     ]);
     const [pendingApproval, approvedNotAssigned, rejectedProjects] = await Promise.all([

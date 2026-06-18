@@ -101,15 +101,19 @@ router.post('/assignments/bulk-csv', verifyToken, checkRole('project_coordinator
   res.json({ success: true, message: `${succeeded} assigned, ${skipped} skipped, ${failed} failed`, results });
 });
 
-// GET /assignments — paginated
-// Query params: page (default 1), limit (default 50, max 200)
+// GET /assignments — paginated, filtered by active batch
 router.get('/assignments', verifyToken, checkRole('project_coordinator', 'hod'), async (req, res) => {
   const { db } = getCollections();
   const { page, limit, skip } = parsePagination(req.query);
   try {
+    const activeBatch = await db.collection('batches').findOne({ isActive: true });
+    // Build filter: if active batch exists, filter by batchId; otherwise return all
+    const filter = activeBatch
+      ? { $or: [{ batchId: activeBatch._id }, { batchId: null }, { batchId: { $exists: false } }] }
+      : {};
     const [assignments, totalRecords] = await Promise.all([
-      db.collection('assignments').find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      db.collection('assignments').countDocuments({}),
+      db.collection('assignments').find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('assignments').countDocuments(filter),
     ]);
     res.json(paginatedResponse(assignments, totalRecords, page, limit));
   } catch (err) { res.status(500).json({ success: false, message: 'Failed to fetch assignments' }); }
