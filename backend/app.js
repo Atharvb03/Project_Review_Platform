@@ -46,7 +46,7 @@ app.use(helmet({
     }
   }
 }));
-
+app.set('trust proxy', 1);
 // ── RATE LIMITING ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
