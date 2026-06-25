@@ -18,7 +18,7 @@ function Footer() {
         <div className="text-center mb-10">
           {/* Brand & Project Info */}
           <div className="flex items-center justify-center gap-3 mb-4">
-            <Logo variant="full" size={32} />
+            <Logo variant="full" size={50} />
           </div>
           <p className={`text-sm leading-relaxed max-w-2xl mx-auto mb-4 ${textSub}`}>
             A comprehensive platform for academic project management, connecting students with mentors for structured reviews and continuous improvement.

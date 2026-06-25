@@ -3,6 +3,7 @@ import { API } from '../config';
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
+import Logo from './Logo';
 
 const roles = [
   { value: 'mentee', label: 'Mentee', icon: '📚', desc: 'Submit and get feedback on projects' },
@@ -113,13 +114,8 @@ function Signup() {
       <div className="w-full max-w-md relative z-10">
         {/* Brand */}
         <div className="text-center mb-8">
-          <div
-            className="inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-4"
-            style={{ background: 'linear-gradient(135deg, #ec4899, #a855f7)', boxShadow: '0 0 30px rgba(236,72,153,0.5)' }}
-          >
-            <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
-            </svg>
+          <div className="flex items-center justify-center mb-4">
+            <Logo variant="icon" size={56} />
           </div>
           <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>Create your account</h1>
           <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>Join the Project Review Platform</p>
